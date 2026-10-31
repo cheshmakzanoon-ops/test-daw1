@@ -606,6 +606,16 @@ impl ChannelState {
     }
 }
 
+/// One tick as `Engine::render_tick` settles it: its index, the frame its samples start on, their count, the
+/// transport plugins see, and whether the tail had already ended the song before this tick.
+struct TickPass {
+    index: u64,
+    start: u64,
+    len: usize,
+    song: TransportInfo,
+    was_done: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Voice {
     channel: usize,
@@ -2705,9 +2715,11 @@ impl Engine {
         Some((&self.out[from..], tick, frame, self.out_held, self.out_len))
     }
 
-    /// Renders the next tick into `self.out`, in the order of spec audio/timing.md ("What a tick does"): the clock
-    /// moves; control points, then automation clips; notes that end are released, then notes that start are
-    /// triggered; then the tick's samples are produced.
+    /// Renders the next tick into `self.out`, phase by phase, in the order of spec audio/timing.md ("What a tick
+    /// does"): [`prepare_tick`](Engine::prepare_tick) settles the position, [`begin_tick`](Engine::begin_tick) advances
+    /// the clock and runs control points and automation, [`schedule_notes`](Engine::schedule_notes) releases and starts
+    /// notes, [`render_sources`](Engine::render_sources) produces the tick's sound, and
+    /// [`finish_tick`](Engine::finish_tick) mixes it and hands it out.
     fn render_tick(&mut self) {
         // Plugins that ask are told they are on the audio thread (CLAP's thread-check), here as on the workers.
         let _audio = crate::parallel::AudioScope::enter();
@@ -2717,6 +2729,17 @@ impl Engine {
         if self.count_in > 0 {
             return self.render_count_in();
         }
+        self.prepare_tick();
+        let tick = self.begin_tick();
+        self.schedule_notes(&tick);
+        self.render_sources(&tick);
+        self.finish_tick(&tick);
+    }
+
+    /// The position work before the tick's clock advances: a render's next span, a quantized song jump, the time
+    /// markers in live playback, a Marker pause's fade and a loop's jump back (spec: audio/song-structure.md,
+    /// audio/transport.md "Time markers in SONG mode").
+    fn prepare_tick(&mut self) {
         // A render that follows the markers goes on at the next span's start, the tick clock running on.
         if self.spans.len() > 1 && self.tick == self.spans[0].1 {
             self.spans.remove(0);
@@ -2767,6 +2790,12 @@ impl Engine {
                 _ => {}
             }
         }
+    }
+
+    /// Advances the clock into the tick and runs what acts at its start: the control points, then the automation
+    /// clips, the plugin parameters and the controller links, in the order of spec audio/timing.md ("What a tick
+    /// does").
+    fn begin_tick(&mut self) -> TickPass {
         let tick = self.tick;
         // The song already ended by the tail rule: only what delay compensation skipped at the head still follows.
         let was_done = self.tail_done;
@@ -2781,43 +2810,55 @@ impl Engine {
         self.run_param_automation(len);
         self.run_controllers(len);
         self.params.flush_ticks();
+        TickPass { index: tick, start, len, song, was_done }
+    }
+
+    /// This tick's notes: what ends is released and what starts is triggered (spec: audio/timing.md), after the buses
+    /// are cleared for the tick's sound and delay compensation has made its first plan.
+    fn schedule_notes(&mut self, t: &TickPass) {
         for b in &mut self.bus {
             b.clear();
-            b.resize(len * 2, 0.0);
+            b.resize(t.len * 2, 0.0);
         }
         if self.pdc.first {
             self.first_plan();
         }
         // One tick before the song's end every note still sounding is released (spec: audio/timing.md).
-        let song_end = !self.looping && !self.live_only && self.end_tick > 0 && tick + 1 == self.end_tick;
-        self.release_notes(tick, song_end);
-        self.start_notes(tick);
+        let song_end = !self.looping && !self.live_only && self.end_tick > 0 && t.index + 1 == self.end_tick;
+        self.release_notes(t.index, song_end);
+        self.start_notes(t.index);
+    }
+
+    /// The tick's sound: the generators (sampler voices and instruments), the metronome and tap clicks, the voices'
+    /// pads, the instruments' outputs, the channels' envelopes and the pause / resume fades (spec: audio/multicore.md,
+    /// ui/metronome.md §4).
+    fn render_sources(&mut self, t: &TickPass) {
         // The sampler voices play into their tracks and the instruments render (on several cores while the generator
         // switch is on; spec: audio/multicore.md); the instruments' outputs join the tracks after the clicks.
-        self.render_generators(len, &song, true);
+        self.render_generators(t.len, &t.song, true);
         // The metronome's click enters its mixer track (spec: ui/metronome.md §4): live playback only, and no new
         // click once a song is over.
         // Counted from the start of the time-signature region the tick is in, so the accent is on its bar lines.
-        let (from, beat, beats) = self.click_bars.iter().rev().find(|r| r.0 <= tick).copied().unwrap_or((0, self.beat_ticks(), self.beats_per_accent));
+        let (from, beat, beats) = self.click_bars.iter().rev().find(|r| r.0 <= t.index).copied().unwrap_or((0, self.beat_ticks(), self.beats_per_accent));
         let click = self.click_track();
         if let Some(m) = self.metronome.as_mut().filter(|_| !self.exporting && !self.live_only) {
-            let start = self.looping || tick < self.end_tick;
-            m.tick(tick - from, beat, beats, start, &mut self.bus[click][..len * 2]);
+            let start = self.looping || t.index < self.end_tick;
+            m.tick(t.index - from, beat, beats, start, &mut self.bus[click][..t.len * 2]);
         }
         if !self.exporting {
-            self.tap_clicks.mix(&mut self.bus[click][..len * 2]);
+            self.tap_clicks.mix(&mut self.bus[click][..t.len * 2]);
         }
-        self.pad_voices(len);
-        self.instruments_out(len);
+        self.pad_voices(t.len);
+        self.instruments_out(t.len);
         for ch in &mut self.channels {
-            ch.advance(len as u32);
+            ch.advance(t.len as u32);
         }
         // Pause / resume: the channels fade out of (into) the mixer's inputs; the effects behind them run on.
         if self.fade_out > 0 || self.fade_in > 0 {
             let total = self.fade_len as f32;
             let (left, out) = if self.fade_out > 0 { (self.fade_out as f32, true) } else { (self.fade_in as f32, false) };
             for b in &mut self.bus {
-                for (f, fr) in b[..len * 2].chunks_exact_mut(2).enumerate() {
+                for (f, fr) in b[..t.len * 2].chunks_exact_mut(2).enumerate() {
                     let down = ((left - f as f32) / total).clamp(0.0, 1.0);
                     let g = if out { down } else { 1.0 - down };
                     fr[0] *= g;
@@ -2825,32 +2866,37 @@ impl Engine {
                 }
             }
             if out {
-                self.fade_out = self.fade_out.saturating_sub(len as u32);
+                self.fade_out = self.fade_out.saturating_sub(t.len as u32);
                 self.held = self.fade_out == 0;
                 if self.held {
                     self.marker_paused = self.pause_at.take().or(self.marker_paused);
                 }
             } else {
-                self.fade_in = self.fade_in.saturating_sub(len as u32);
+                self.fade_in = self.fade_in.saturating_sub(t.len as u32);
             }
         }
-        self.tick = tick + 1;
+    }
+
+    /// The tick's mix and what leaves the engine: the main volume, the tail rule, the device's outputs and the block
+    /// handed to the caller (spec: audio/mixer.md "Main volume", audio/timing.md "Where the file ends").
+    fn finish_tick(&mut self, t: &TickPass) {
+        self.tick = t.index + 1;
         // A nudge pressed or let go changes the ticks after this one, as a tempo change does.
         let nudge = self.nudge.as_ref().filter(|_| !self.exporting).map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed).signum());
         if nudge != self.nudged {
             self.nudged = nudge;
             self.clock.set_tempo(self.rate, self.ppq, self.clock_tempo());
         }
-        self.frame = start + len as u64;
-        self.mix(len, &song);
+        self.frame = t.start + t.len as u64;
+        self.mix(t.len, &t.song);
         self.out.clear();
-        self.out.extend_from_slice(&self.bus[0][..len * 2]);
+        self.out.extend_from_slice(&self.bus[0][..t.len * 2]);
         // The main volume (spec: audio/mixer.md "Main volume"): playback hears it as a ramped gain on the master; an
         // export writes the samples without it and only its tail test sees it.
         let gain = if self.exporting {
             self.main_gain
         } else {
-            let mut ramp = self.main_glide.block(self.main_gain, len, os_dsp::glide::engine_limit(self.rate));
+            let mut ramp = self.main_glide.block(self.main_gain, t.len, os_dsp::glide::engine_limit(self.rate));
             if !(ramp.is_flat() && ramp.first() == 1.0) {
                 for f in self.out.chunks_exact_mut(2) {
                     let g = ramp.next();
@@ -2863,22 +2909,22 @@ impl Engine {
         // The tail rule: the first quiet tick at or after the song's end is the last one. With delay compensation, and
         // the stored main volume exactly 12800, only the part of the tick the file has by then is tested: with a delay
         // of a tick or more none, and the tick counts as quiet (spec: audio/timing.md "Where the file ends").
-        if !self.looping && !self.live_only && tick >= self.end_tick {
+        if !self.looping && !self.live_only && t.index >= self.end_tick {
             let d = self.pdc.lag as usize;
             let quiet = if d > 0 && self.main_unity {
-                d >= len || (!self.inst_active && self.out[2 * d..].iter().all(|s| (s * gain).abs() < QUIET))
+                d >= t.len || (!self.inst_active && self.out[2 * d..].iter().all(|s| (s * gain).abs() < QUIET))
             } else {
                 !self.inst_active && self.out.iter().all(|s| (s * gain).abs() < QUIET)
             };
             let limit = (TAIL_LIMIT_SECONDS * f64::from(self.rate) / self.clock.samples_per_tick()) as u64;
-            if quiet || tick >= self.end_tick + limit {
+            if quiet || t.index >= self.end_tick + limit {
                 self.tail_done = true;
             }
         }
         self.route_out();
-        self.hand_out(tick, start, false, was_done);
+        self.hand_out(t.index, t.start, false, t.was_done);
         // The file keeps its length: as many frames as the head skipped follow the tick that ended the song.
-        if self.tail_done && !was_done && self.pdc.lag > 0 {
+        if self.tail_done && !t.was_done && self.pdc.lag > 0 {
             self.pdc.flush = Some(self.pdc.lag - self.pdc.head);
         }
     }
