@@ -28,8 +28,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use os_engine::effects::peak_ctrl;
 use os_engine::{Engine, Instrument, PlayMode, SampleLibrary, SharedInstrument};
-use os_model::{Arrangement, Channel, ChannelKind, Clip, ClipSource, ControlPoint, MixerTrack, Note, Pattern, Project};
+use os_model::{Arrangement, AutoPoint, Automation, Channel, ChannelKind, Clip, ClipSource, ControllerLink, ControlPoint, MixerTrack, Note, Pattern, Project, SlotPlugin};
 
 /// The rate every case renders at.
 const RATE: u32 = 48_000;
@@ -251,6 +252,67 @@ impl Instrument for Sine {
     }
 }
 
+/// Song mode with an automation clip: its curve drives a channel's volume and a mixer pan over four beats.
+fn automation_clip() -> Project {
+    let mut automation = channel(1, 1);
+    automation.kind = ChannelKind::Automation;
+    // A new clip's range, 0..1 (stored pan 0, volume 12800).
+    (automation.pan, automation.volume) = (-1.0, 1.0);
+    Project {
+        ppq: 96,
+        tempo: Some(130.0),
+        channels: vec![channel(0, 0), automation],
+        mixer: vec![MixerTrack::new(0), MixerTrack::new(1)],
+        patterns: vec![Pattern {
+            number: 1,
+            notes: vec![
+                Note { length: 48, key: 60, velocity: 100, ..Note::step(0, 0) },
+                Note { length: 48, key: 67, velocity: 90, ..Note::step(0, 48) },
+            ],
+            ..Pattern::default()
+        }],
+        arrangements: vec![Arrangement {
+            id: os_model::Id::NONE,
+            number: 1,
+            name: None,
+            clips: vec![Clip::new(0, 192, 0, ClipSource::Pattern(1)), Clip::new(48, 144, 1, ClipSource::Channel(1))],
+            tracks: vec![],
+            markers: vec![],
+        }],
+        automations: vec![Automation {
+            channel: 1,
+            targets: vec![
+                os_model::target::channel(0, os_model::target::CHANNEL_VOLUME),
+                os_model::target::mixer(1, os_model::target::MIXER_PAN),
+            ],
+            points: vec![AutoPoint::new(0.0, 1.0), AutoPoint::new(4.0, 0.0)],
+            header: vec![0; 21],
+            tail: vec![],
+            lfo: Default::default(),
+        }],
+        current_arrangement: Some(1),
+        ..Project::default()
+    }
+}
+
+/// A Peak Controller in a mixer slot driving two targets through controller links: its peak straight to a fader with
+/// smoothing, and its LFO inverted to a channel's volume.
+fn controller_links() -> Project {
+    let mut p = pattern_sampler();
+    p.mixer.push(MixerTrack::new(2));
+    p.mixer[1].slots[0] = Some(SlotPlugin {
+        id: os_model::Id::NONE,
+        name: "Fruity Peak Controller".into(),
+        state: peak_ctrl::Settings::default().to_state(),
+    });
+    let mut fader = ControllerLink::new(0x7000 + 64, 1, os_model::target::mixer(2, os_model::target::MIXER_VOLUME));
+    fader.bytes[12] |= 0x02; // Smoothing on.
+    let mut volume = ControllerLink::new(0x7000 + 64, 2, os_model::target::channel(0, os_model::target::CHANNEL_VOLUME));
+    volume.formula = Some("1-Input".into());
+    p.controller_links = vec![fader, volume];
+    p
+}
+
 fn cases() -> Vec<Case> {
     let (hooked, sine) = hosted_sine();
     let (base, edited) = level_edit_in_place();
@@ -260,6 +322,8 @@ fn cases() -> Vec<Case> {
         Case { name: "control_points", project: control_points(), mode: PlayMode::Pattern(1), ticks: 72, instruments: vec![], level_edit: None },
         Case { name: "level_edit_in_place", project: base, mode: PlayMode::Pattern(1), ticks: 64, instruments: vec![], level_edit: Some(edited) },
         Case { name: "hosted_sine", project: hooked, mode: PlayMode::Pattern(1), ticks: 40, instruments: vec![(0, sine)], level_edit: None },
+        Case { name: "automation_clip", project: automation_clip(), mode: PlayMode::Song, ticks: 160, instruments: vec![], level_edit: None },
+        Case { name: "controller_links", project: controller_links(), mode: PlayMode::Pattern(1), ticks: 48, instruments: vec![], level_edit: None },
     ]
 }
 
