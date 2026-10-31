@@ -1735,13 +1735,18 @@ impl Engine {
                 self.report.plugin_channels_silent = self.report.plugin_channels_silent.saturating_sub(1);
             }
             ch.plugin = true;
+            let mut panicked = false;
             if let Ok(h) = inst.try_lock() {
                 let mine = |g: Target| matches!(g, Target::ChannelParam(c, _) if usize::from(c) == channel);
-                param_points(&mut self.controls, mine, |k| h.param_range(k));
+                panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    param_points(&mut self.controls, mine, |k| h.param_range(k));
+                }))
+                .is_err();
             }
             ch.instrument = Slot(Some(inst));
-            // A new instance starts unquarantined: restarting a plugin is the user's recovery from a panic.
-            ch.host_panics.store(0, Ordering::Relaxed);
+            // A new instance starts unquarantined unless reading its parameter ranges panicked (then it never runs);
+            // restarting a plugin is the user's recovery from a panic.
+            ch.host_panics.store(u32::from(panicked), Ordering::Relaxed);
             // Its delay is read after it processes; the pads are worked out again then.
             self.pdc.due = true;
             // A new instance owes nothing its predecessor missed.
@@ -1760,11 +1765,17 @@ impl Engine {
         }
         t.effects.retain(|e| e.slot != slot);
         let at = t.effects.partition_point(|e| e.slot < slot);
+        let mut panicked = false;
         if let Ok(h) = fx.try_lock() {
             let mine = |g: Target| matches!(g, Target::SlotParam(a, b, _) if usize::from(a) == track && usize::from(b) == slot);
-            param_points(&mut self.controls, mine, |k| h.param_range_fx(k));
+            panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                param_points(&mut self.controls, mine, |k| h.param_range_fx(k));
+            }))
+            .is_err();
         }
-        t.effects.insert(at, FxSlot::new(slot, t.slot_on[slot], t.slot_mix[slot], Fx::Hosted(fx)));
+        let slot = FxSlot::new(slot, t.slot_on[slot], t.slot_mix[slot], Fx::Hosted(fx));
+        slot.host_panics.store(u32::from(panicked), Ordering::Relaxed);
+        t.effects.insert(at, slot);
         self.pdc.due = true;
     }
 
@@ -3517,6 +3528,13 @@ impl Engine {
     }
 }
 
+/// Runs `f` on a hosted instrument; a panic quarantines its channel and is swallowed, so teardown goes on.
+fn catch_hosted(ch: &ChannelState, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        ch.host_panics.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Notes still held on instruments end when the engine goes away (stop, or a new song).
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -3533,8 +3551,13 @@ impl Engine {
         // Audio clips a hosted instrument plays end with a choke of their voice: a note off would leave a sample
         // without a volume envelope playing on.
         for &(_, c, key, voice) in &self.inst_offs {
-            if let (Some(v), Some(Ok(mut inst))) = (voice, self.channels.get(c).and_then(|ch| ch.instrument.0.as_ref()).map(|i| i.lock())) {
-                inst.voice_choke(0, sent(c, key), v);
+            let Some(ch) = self.channels.get(c) else { continue };
+            let Some(v) = voice else { continue };
+            if ch.host_panics.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+            if let Some(Ok(mut inst)) = ch.instrument.0.as_ref().map(|i| i.lock()) {
+                catch_hosted(ch, || inst.voice_choke(0, sent(c, key), v));
             }
         }
         let mut held: Vec<(usize, u8)> = self.inst_offs.iter().filter(|o| o.3.is_none()).map(|&(_, c, key, _)| (c, key)).collect();
@@ -3547,8 +3570,12 @@ impl Engine {
         held.sort_unstable();
         held.dedup();
         for (c, key) in held {
-            if let Some(Ok(mut inst)) = self.channels.get(c).and_then(|ch| ch.instrument.0.as_ref()).map(|i| i.lock()) {
-                inst.note_off(0, sent(c, key));
+            let Some(ch) = self.channels.get(c) else { continue };
+            if ch.host_panics.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+            if let Some(Ok(mut inst)) = ch.instrument.0.as_ref().map(|i| i.lock()) {
+                catch_hosted(ch, || inst.note_off(0, sent(c, key)));
             }
         }
     }
@@ -3898,129 +3925,123 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
     // instrument applies root and fine itself) reaches the instrument as each note's tuning, with the note's fine
     // pitch, on top of any glide; notes keep the pitch they started with. A plugin channel's instrument that ignores a
     // tuning hears its whole semitones as moved keys instead.
-    let shift = ch.hosted_shift();
-    fines.moves = !ch.own_tuning && !inst.takes_tuning();
-    // A changed channel pitch reaches the notes already sounding.
-    if fines.shift != shift {
-        fines.shift = shift;
-        for key in (0..128u8).filter(|&k| fines.keys >> k & 1 == 1) {
-            inst.tune(0, fines.sent(key), fines.tuning(key));
+    // Every call into the plugin sits inside one guard: a panic on a note, parameter, transport, tuning, level,
+    // voice, latency, tail or processing call quarantines the instance, silences the channel, and the render goes on.
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shift = ch.hosted_shift();
+        fines.moves = !ch.own_tuning && !inst.takes_tuning();
+        // A changed channel pitch reaches the notes already sounding.
+        if fines.shift != shift {
+            fines.shift = shift;
+            for key in (0..128u8).filter(|&k| fines.keys >> k & 1 == 1) {
+                inst.tune(0, fines.sent(key), fines.tuning(key));
+            }
         }
-    }
-    // Ticks it missed are made up first: their notes at once, then their frames, unheard (at most a second; an
-    // instance held longer than that loses that much of its place).
-    let owed = std::mem::take(owed);
-    let mut missed = cx.missed.iter().filter(|m| m.0 == c).peekable();
-    if owed > 0 || missed.peek().is_some() {
+        // Ticks it missed are made up first: their notes at once, then their frames, unheard (at most a second; an
+        // instance held longer than that loses that much of its place).
+        let owed = std::mem::take(owed);
+        let mut missed = cx.missed.iter().filter(|m| m.0 == c).peekable();
+        if owed > 0 || missed.peek().is_some() {
+            inst.transport(cx.song);
+            for m in missed {
+                send_note(&mut *inst, 0, m.1, fines);
+            }
+            let mut left = owed.min(cx.rate as usize);
+            while left > 0 {
+                let k = left.min(sc.l.len());
+                if k == 0 {
+                    break;
+                }
+                inst.process(cx.rate, &mut sc.l[..k], &mut sc.r[..k]);
+                left -= k;
+            }
+        }
         inst.transport(cx.song);
-        for m in missed {
-            send_note(&mut *inst, 0, m.1, fines);
+        // Controller messages before this tick's notes.
+        for &(_, bytes) in cx.midi.iter().filter(|m| m.0 == c) {
+            inst.midi(0, bytes);
         }
-        let mut left = owed.min(cx.rate as usize);
-        while left > 0 {
-            let k = left.min(sc.l.len());
-            if k == 0 {
-                break;
+        // The layer whose notes it plays adds its levels to the channel's.
+        let layer = ch.via.and_then(|w| cx.channels.get(w.layer).map(|l| (l.layer_adds(), w.gain)));
+        let mut levels = ch.levels();
+        if let Some((a, gain)) = layer {
+            levels.volume = (f64::from(levels.volume) * a.volume * gain) as f32;
+            levels.pan += a.pan as f32;
+            levels.mod_x += a.mods.0;
+            levels.mod_y += a.mods.1;
+        }
+        let own_levels = inst.channel_levels(levels);
+        inst.channel_voicing(&ch.voicing);
+        // Parameter values before the notes at the same frame (spec: plugins/plugin-parameters.md §2); one per tick at its
+        // start for a plugin that takes them so (spec: plugins/fruity-abi.md "Parameters").
+        if inst.tick_params() {
+            for (index, value) in cx.params.channel_ticks(c) {
+                inst.param(0, index, value);
             }
-            inst.process(cx.rate, &mut sc.l[..k], &mut sc.r[..k]);
-            left -= k;
-        }
-    }
-    inst.transport(cx.song);
-    // Controller messages before this tick's notes.
-    for &(_, bytes) in cx.midi.iter().filter(|m| m.0 == c) {
-        inst.midi(0, bytes);
-    }
-    // The layer whose notes it plays adds its levels to the channel's.
-    let layer = ch.via.and_then(|w| cx.channels.get(w.layer).map(|l| (l.layer_adds(), w.gain)));
-    let mut levels = ch.levels();
-    if let Some((a, gain)) = layer {
-        levels.volume = (f64::from(levels.volume) * a.volume * gain) as f32;
-        levels.pan += a.pan as f32;
-        levels.mod_x += a.mods.0;
-        levels.mod_y += a.mods.1;
-    }
-    let own_levels = inst.channel_levels(levels);
-    inst.channel_voicing(&ch.voicing);
-    // Parameter values before the notes at the same frame (spec: plugins/plugin-parameters.md §2); one per tick at its
-    // start for a plugin that takes them so (spec: plugins/fruity-abi.md "Parameters").
-    if inst.tick_params() {
-        for (index, value) in cx.params.channel_ticks(c) {
-            inst.param(0, index, value);
-        }
-    } else {
-        for (off, index, value) in cx.params.channel_span(c, 0, n) {
-            inst.param(off, index, value);
-        }
-    }
-    for &(_, off, note) in notes {
-        send_note(&mut *inst, off.min(n.saturating_sub(1) as u32), note, fines);
-    }
-    // Audio clip fades and gain on this channel (spec: audio/audio-clips.md "Fades and clip gain"): on each clip's
-    // voice when the instrument takes voice gains, so clips that overlap (a crossfade) each have their own. A voice
-    // gets its gain now at its start, then every `VOICE_GAIN_FRAMES` frames the gain due that many frames on, which it
-    // glides to; a gain that stays is not sent again.
-    let voiced = inst.voice_gains();
-    // SAFETY: only this channel's turn touches its clips.
-    let shapes = || unsafe { cx.shapes.of_channel(c) };
-    if voiced {
-        let step = crate::instrument::VOICE_GAIN_FRAMES;
-        for s in shapes() {
-            if s.sent.is_none() {
-                let g = s.shape.at(s.age);
-                inst.voice_gain(0, s.voice, g);
-                s.sent = Some(g);
+        } else {
+            for (off, index, value) in cx.params.channel_span(c, 0, n) {
+                inst.param(off, index, value);
             }
-            for off in (0..n as u32).step_by(step as usize) {
-                let g = s.shape.at(s.age + u64::from(off + step));
-                if s.sent != Some(g) {
-                    inst.voice_gain(off, s.voice, g);
+        }
+        for &(_, off, note) in notes {
+            send_note(&mut *inst, off.min(n.saturating_sub(1) as u32), note, fines);
+        }
+        // Audio clip fades and gain on this channel (spec: audio/audio-clips.md "Fades and clip gain"): on each clip's
+        // voice when the instrument takes voice gains, so clips that overlap (a crossfade) each have their own. A voice
+        // gets its gain now at its start, then every `VOICE_GAIN_FRAMES` frames the gain due that many frames on, which it
+        // glides to; a gain that stays is not sent again.
+        let voiced = inst.voice_gains();
+        // SAFETY: only this channel's turn touches its clips.
+        let shapes = || unsafe { cx.shapes.of_channel(c) };
+        if voiced {
+            let step = crate::instrument::VOICE_GAIN_FRAMES;
+            for s in shapes() {
+                if s.sent.is_none() {
+                    let g = s.shape.at(s.age);
+                    inst.voice_gain(0, s.voice, g);
                     s.sent = Some(g);
+                }
+                for off in (0..n as u32).step_by(step as usize) {
+                    let g = s.shape.at(s.age + u64::from(off + step));
+                    if s.sent != Some(g) {
+                        inst.voice_gain(off, s.voice, g);
+                        s.sent = Some(g);
+                    }
                 }
             }
         }
-    }
-    let (l, r) = (&mut sc.l[..n], &mut sc.r[..n]);
-    // A panic in the plugin's own processing is caught here, at the host call site: the instance is quarantined (see
-    // the check above), the channel plays silence, and the render goes on. `active` and the delay are read inside the
-    // guard so a later call cannot panic the tick.
-    let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (l, r) = (&mut sc.l[..n], &mut sc.r[..n]);
         inst.process(cx.rate, l, r);
-        (inst.reported_delay(), inst.active())
+        out.delay = inst.reported_delay();
+        // An instrument without voice gains: the clips' shapes on its whole output. A clip that has ended keeps the channel
+        // silent through its choke's tail only while no other clip of the channel plays; then the playing clips' gains
+        // alone count. Clips that overlap still share one gain, so a crossfade between them dips.
+        if !voiced && shapes().next().is_some() {
+            for f in 0..n {
+                let ended = |s: &InstClip| s.shape.since + s.age + f as u64 >= s.shape.total;
+                let playing = shapes().any(|s| !ended(&*s));
+                let g: f32 = shapes().filter(|s| !(playing && ended(&**s))).map(|s| s.shape.at(s.age + f as u64)).product();
+                l[f] *= g;
+                r[f] *= g;
+            }
+        }
+        out.active = inst.active();
+        // An audio clip channel's voices are its playlist clips: their own level is on the channel's output, since a
+        // hosted sampler takes velocities only up to 128 (spec: audio/audio-clips.md "Level").
+        let cl = ch.clip_level;
+        let (gl, gr) = if own_levels { (cl, cl) } else { ch.gain_via(f64::from(cl), 0.0, layer) };
+        out.buf.extend(l.iter().zip(r.iter()).flat_map(|(&a, &b)| [a * gl, b * gr]));
+        // Delay compensation: the channel waits for the latest path into its track.
+        if let Some(pad) = pad.filter(|p| p.len() > 0) {
+            pad.run(&mut out.buf);
+        }
     }));
-    let (delay, active) = match processed {
-        Ok(v) => v,
-        Err(_) => {
-            ch.host_panics.fetch_add(1, Ordering::Relaxed);
-            l.fill(0.0);
-            r.fill(0.0);
-            out.delay = 0;
-            out.buf.resize(n * 2, 0.0);
-            return;
-        }
-    };
-    out.delay = delay;
-    // An instrument without voice gains: the clips' shapes on its whole output. A clip that has ended keeps the channel
-    // silent through its choke's tail only while no other clip of the channel plays; then the playing clips' gains
-    // alone count. Clips that overlap still share one gain, so a crossfade between them dips.
-    if !voiced && shapes().next().is_some() {
-        for f in 0..n {
-            let ended = |s: &InstClip| s.shape.since + s.age + f as u64 >= s.shape.total;
-            let playing = shapes().any(|s| !ended(&*s));
-            let g: f32 = shapes().filter(|s| !(playing && ended(&**s))).map(|s| s.shape.at(s.age + f as u64)).product();
-            l[f] *= g;
-            r[f] *= g;
-        }
-    }
-    out.active = active;
-    // An audio clip channel's voices are its playlist clips: their own level is on the channel's output, since a
-    // hosted sampler takes velocities only up to 128 (spec: audio/audio-clips.md "Level").
-    let cl = ch.clip_level;
-    let (gl, gr) = if own_levels { (cl, cl) } else { ch.gain_via(f64::from(cl), 0.0, layer) };
-    out.buf.extend(l.iter().zip(r.iter()).flat_map(|(&a, &b)| [a * gl, b * gr]));
-    // Delay compensation: the channel waits for the latest path into its track.
-    if let Some(pad) = pad.filter(|p| p.len() > 0) {
-        pad.run(&mut out.buf);
+    if body.is_err() {
+        ch.host_panics.fetch_add(1, Ordering::Relaxed);
+        out.active = false;
+        out.delay = 0;
+        out.buf.clear();
+        out.buf.resize(n * 2, 0.0);
     }
 }
 

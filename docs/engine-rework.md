@@ -41,16 +41,18 @@ the other targets need FL's tick walk. Reopening it likewise needs a product dec
 
 ## Decision: a panicking hosted plugin is quarantined, not fatal
 
-Hosted instruments and effects are called in-process. The engine wraps the plugin's processing call in
-`std::panic::catch_unwind` at the two call sites (`instrument_job` and `run_slot`). The first panic increments a
-per-instance counter: the instance is never entered again for the engine's life, its channel plays silence (an effect
-slot passes the sound through), the render continues, and `Engine::host_panics()` reports the count. The quarantine is
-per instance and per engine; restarting the plugin creates a new instance and clears it. A healthy plugin takes the
-same call path as before, so no golden render moved.
+Hosted instruments and effects are called in-process. The engine wraps every hosted trait call it makes in
+`std::panic::catch_unwind` and the existing per-instance counter: a channel's whole hosted turn (tuning, transport,
+MIDI, levels and voicing, parameters, notes, voice gains, processing, latency and active queries), the note-offs and
+chokes sent on release and drop, and the parameter-range reads at attach. For an effect, reset, transport, parameter
+delivery, controller-output reads, latency reads, parameter-range reads and processing are guarded. The first panic
+increments the counter: the instance is never entered again for the engine's life, its channel plays silence (an
+effect slot passes the sound through), render and teardown continue, and `Engine::host_panics()` reports the count.
+The quarantine is per instance and per engine; reattaching an instrument clears it (the user's restart), and attaching
+an effect creates a new slot. A healthy plugin takes the same calls as before, so no golden render moved.
 
-The bound is Rust panics only. For an instrument, the guarded call covers processing, its reported latency and its
-active state; panics in the calls before it (notes, parameters, transport) still unwind. An effect's reset,
-transport and processing calls are inside its guard. A raw fault in native plugin code (a segmentation fault or an
-abort) does not unwind a Rust stack and still ends the process. Windows' SEH guard in
-`os-host` contains access violations for that platform only; on macOS and Linux, containing native faults needs
-out-of-process hosting, which remains open in the alpha checklist.
+The bound is Rust panics only. A panic from a plugin's own destructor, when the last `Arc` is dropped (including when
+the engine itself is dropped), is not caught: the guard covers calls the engine makes, not arbitrary `Drop` code. A
+raw fault in native plugin code (a segmentation fault or an abort) does not unwind a Rust stack and still ends the
+process. Windows' SEH guard in `os-host` contains access violations for that platform only; on macOS and Linux,
+containing native faults needs out-of-process hosting, which remains open in the alpha checklist.

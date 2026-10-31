@@ -308,17 +308,46 @@ impl Engine {
         let (until, wait, export) = (&mut self.busy_until, self.busy_wait, self.exporting);
         for (c, ch) in self.channels.iter().enumerate() {
             let Some(inst) = ch.instrument.0.as_ref().filter(|i| !i.is_poisoned()) else { continue };
-            if let (Some(i), Some(d)) = (lock_busy(inst, until, wait, export), self.pdc.chan_delay.get_mut(c)) {
-                *d = i.reported_delay();
+            if ch.host_panics.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if let Some(delay) = self.pdc.chan_delay.get_mut(c) {
+                    *delay = 0;
+                }
+                continue;
+            }
+            let Some(i) = lock_busy(inst, until, wait, export) else { continue };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| i.reported_delay())) {
+                Ok(d) => {
+                    if let Some(delay) = self.pdc.chan_delay.get_mut(c) {
+                        *delay = d;
+                    }
+                }
+                Err(_) => {
+                    ch.host_panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(delay) = self.pdc.chan_delay.get_mut(c) {
+                        *delay = 0;
+                    }
+                }
             }
         }
         for fx in self.tracks.iter_mut().flat_map(|t| t.effects.iter_mut()) {
             fx.delay = match &fx.fx {
                 Fx::Own(e) => e.latency() as u32,
-                Fx::Hosted(h) => match h.is_poisoned() {
-                    true => 0,
-                    false => lock_busy(h, until, wait, export).map_or(fx.delay, |h| h.reported_delay_fx()),
-                },
+                Fx::Hosted(h) => {
+                    if h.is_poisoned() || fx.host_panics.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        0
+                    } else {
+                        match lock_busy(h, until, wait, export) {
+                            Some(h) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.reported_delay_fx())) {
+                                Ok(d) => d,
+                                Err(_) => {
+                                    fx.host_panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    0
+                                }
+                            },
+                            None => fx.delay,
+                        }
+                    }
+                }
             };
         }
     }

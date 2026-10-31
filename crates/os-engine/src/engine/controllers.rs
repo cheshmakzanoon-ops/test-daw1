@@ -62,9 +62,21 @@ pub(super) fn links(project: &os_model::Project) -> Vec<CtlLink> {
 /// Output `k` of the controller in `track`'s slot `slot`, as its last tick left it.
 fn read(tracks: &[MixTrack], track: usize, slot: usize, k: usize) -> Option<f32> {
     let fx = tracks.get(track)?.effects.iter().find(|f| f.slot == slot)?;
+    if fx.host_panics.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        return None;
+    }
     match &fx.fx {
         Fx::Own(e) => e.control(k),
-        Fx::Hosted(h) => h.try_lock().ok()?.control_fx(k),
+        Fx::Hosted(h) => {
+            let h = h.try_lock().ok()?;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.control_fx(k))) {
+                Ok(v) => v,
+                Err(_) => {
+                    fx.host_panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+            }
+        }
     }
 }
 

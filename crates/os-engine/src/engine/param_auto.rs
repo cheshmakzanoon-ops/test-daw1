@@ -140,6 +140,9 @@ impl ParamAuto {
             if !self.events.iter().chain(&self.ticks).any(|e| e.dest == dest) {
                 continue;
             }
+            if fx.host_panics.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                continue;
+            }
             // A busy instance misses these values: they are sent again at the next step.
             let Ok(mut h) = h.try_lock() else {
                 let mine = |tg: &Target| matches!(*tg, Target::SlotParam(a, b, _) if usize::from(a) == t && usize::from(b) == fx.slot);
@@ -147,9 +150,14 @@ impl ParamAuto {
                 self.last_tick.retain(|(tg, _)| !mine(tg));
                 continue;
             };
-            let list = if h.tick_params_fx() { &self.ticks } else { &self.events };
-            for e in list.iter().filter(|e| e.dest == dest) {
-                h.param_fx(e.offset, e.index, e.value);
+            let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let list = if h.tick_params_fx() { &self.ticks } else { &self.events };
+                for e in list.iter().filter(|e| e.dest == dest) {
+                    h.param_fx(e.offset, e.index, e.value);
+                }
+            }));
+            if delivered.is_err() {
+                fx.host_panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
