@@ -3534,8 +3534,9 @@ impl Engine {
     }
 }
 
-/// Resampling window half-width in source samples.
-const SINC_W: f64 = 13.5;
+/// The engine sampler's resampling window (`os_dsp::resample::ENGINE_W`): the kernel itself lives in
+/// `os_dsp::resample` beside the hosted sampler's.
+const SINC_W: f64 = os_dsp::resample::ENGINE_W;
 
 /// Adds one voice into its channel's insert bus for block frames `offset..end`.
 /// Returns false when the voice has finished.
@@ -3623,26 +3624,8 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
                 *left as f32 / *len as f32
             }
         };
-        let (l, r) = if exact {
-            let i = pos as usize;
-            (s.left[i], s.right[i])
-        } else if w <= 1.0 {
-            // Linear (an export's 2-point resampling).
-            let i = pos as usize;
-            let (j, x) = ((i + 1).min(n - 1), (pos - i as f64) as f32);
-            (s.left[i] + (s.left[j] - s.left[i]) * x, s.right[i] + (s.right[j] - s.right[i]) * x)
-        } else {
-            let i0 = (pos - w).ceil().max(0.0) as usize;
-            let i1 = ((pos + w).floor() as usize).min(n - 1);
-            let (mut l, mut r) = (0.0f64, 0.0f64);
-            for i in i0..=i1 {
-                let t = i as f64 - pos;
-                let k = sinc(t / scale) / scale * blackman(t, w);
-                l += f64::from(s.left[i]) * k;
-                r += f64::from(s.right[i]) * k;
-            }
-            (l as f32, r as f32)
-        };
+        // The kernel lives beside the hosted sampler's in `os_dsp::resample`, where both are documented.
+        let (l, r) = os_dsp::resample::read_engine(&s.left, &s.right, pos, scale, w, exact);
         if let Some(r) = glide {
             // The volume parameter glides linearly and the volume law applies to it; the pan glides linearly
             // in the left / right gains (spec: audio/pattern-controls.md).
@@ -3671,23 +3654,6 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
     v.gain = (gl, gr);
     v.ramp_left = left;
     pos < n as f64
-}
-
-fn sinc(x: f64) -> f64 {
-    if x == 0.0 {
-        1.0
-    } else {
-        let px = std::f64::consts::PI * x;
-        px.sin() / px
-    }
-}
-
-fn blackman(t: f64, w: f64) -> f64 {
-    if t.abs() >= w {
-        return 0.0;
-    }
-    let x = std::f64::consts::PI * t / w;
-    0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos()
 }
 
 /// One mixer track's own state for its turn in a tick (`mix_track`).

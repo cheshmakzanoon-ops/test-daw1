@@ -16,6 +16,8 @@
 //! - [`Quality::Table`] reads the weights from tables made once, interpolated linearly: within about 4e-7 of the
 //!   formula and several times cheaper. Live playback uses it.
 //!
+//! The engine's built-in sampler keeps a kernel of its own here ([`read_engine`]); its docs list how the two differ.
+//!
 // spec: audio/sampler.md ("The resampler", "How many frames", "Frames outside the data")
 
 use std::f64::consts::PI;
@@ -249,9 +251,83 @@ pub fn read_by(len: usize, pos: f64, ratio: f64, quality: Quality, at: impl Fn(u
     (l, r)
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The engine's built-in sampler kernel (spec: audio/sampler.md "The resampler")
+
+/// The engine sampler's window: 13.5 frames either side of the read position, whatever the ratio.
+pub const ENGINE_W: f64 = 13.5;
+
+/// One stereo frame as the engine's built-in sampler reads it: [`read`]'s counterpart for the engine's kernel.
+///
+/// Kept bit-identical to the inline loop `os-engine` used before the kernel moved here (the golden renders in
+/// `os-engine/tests/golden` pin it): a whole position at a step of 1 copies the frame (`exact`), a window of 1 or less
+/// interpolates two frames, and any other window sums the Blackman-windowed sinc below over `pos ± window`.
+///
+/// It differs from [`read`] in the window (0.42 / 0.5 / 0.08 at 13.5 frames against 0.34 / 0.5 / 0.16 at 16 or more),
+/// in the sinc's argument (`sin(pi t / scale) / scale` against `sin(a t) / (pi t)` with `a = pi / ratio`) and at the
+/// sample's edges (taps outside it are left out here, held at its first and last frames there). Moving the engine onto
+/// [`read`] would change how every engine-sampled project sounds: a product decision, not a refactor.
+pub fn read_engine(left: &[f32], right: &[f32], pos: f64, scale: f64, window: f64, exact: bool) -> (f32, f32) {
+    let n = left.len().min(right.len());
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    if exact {
+        let i = (pos as usize).min(n - 1);
+        return (left[i], right[i]);
+    }
+    if window <= 1.0 {
+        // Linear (an export's 2-point resampling).
+        let i = (pos as usize).min(n - 1);
+        let (j, x) = ((i + 1).min(n - 1), (pos - i as f64) as f32);
+        return (left[i] + (left[j] - left[i]) * x, right[i] + (right[j] - right[i]) * x);
+    }
+    let i0 = (pos - window).ceil().max(0.0) as usize;
+    let i1 = ((pos + window).floor() as usize).min(n - 1);
+    let (mut l, mut r) = (0.0f64, 0.0f64);
+    for i in i0..=i1 {
+        let t = i as f64 - pos;
+        let k = sinc(t / scale) / scale * blackman(t, window);
+        l += f64::from(left[i]) * k;
+        r += f64::from(right[i]) * k;
+    }
+    (l as f32, r as f32)
+}
+
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        let px = PI * x;
+        px.sin() / px
+    }
+}
+
+fn blackman(t: f64, w: f64) -> f64 {
+    if t.abs() >= w {
+        return 0.0;
+    }
+    let x = PI * t / w;
+    0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's kernel: a whole position at a step of 1 copies the frame, a window of 1 interpolates two frames
+    /// linearly, and the sinc at a whole position sums back to the frame.
+    #[test]
+    fn the_engine_kernel_reads_its_three_ways() {
+        let x: Vec<f32> = (0..400).map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5).collect();
+        assert_eq!(read_engine(&x, &x, 40.0, 1.0, ENGINE_W, true), (x[40], x[40]));
+        let (l, _) = read_engine(&x, &x, 40.25, 1.0, 1.0, false);
+        assert_eq!(l, x[40] + (x[41] - x[40]) * 0.25, "the linear window");
+        let (l, _) = read_engine(&x, &x, 100.0, 1.0, ENGINE_W, false);
+        assert!((l - x[100]).abs() < 2e-3, "the sinc at a whole position: {l} vs {}", x[100]);
+        // Near the sample's start the taps outside it are left out.
+        assert!(read_engine(&x, &x, 0.5, 1.0, ENGINE_W, false).0.is_finite());
+    }
 
     fn exact(f: f64, ratio: f64) -> Vec<f64> {
         let n = half_width(ratio);
