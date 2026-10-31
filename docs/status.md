@@ -250,6 +250,7 @@ and Touch controller. Kept with the program's settings, not the project. Which w
   Fruity effects that an old project hosts through the plugin wrapper stay wrapped, and a 3x Osc saved before FL
   Studio 21 opens with its envelope and filter settings at their defaults
 - Anything in a file that Lemon Studio does not understand yet is kept and written back unchanged
+- The mixer's three-band equaliser is saved with its track and follows it when tracks are moved, deleted or trimmed
 - An opened project's samples load behind a progress panel, one file at a time or on up to 4 threads
   (General settings ▸ Advanced ▸ Threaded project sample loading)
 - A save that writes a file over General settings ▸ Hints and warnings ▸ Project data size warning (100 MB

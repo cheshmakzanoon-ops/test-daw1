@@ -3276,6 +3276,18 @@ pub fn apply(project: &Project, file: &mut FlpFile) -> Result<(), ProjectError> 
                 }
             }
         }
+        // The three-band equaliser (spec: flp/events/mixer.md, event 225): the nine records at the track's location,
+        // rewritten when any band changes. A moved or renumbered track writes its own values at its new location.
+        if m.eq != old.eq {
+            if let Some(data) = params.as_mut() {
+                let loc = mixer_location(record_track(m.index, project.mixer.len()), 0);
+                for (b, band) in m.eq.iter().enumerate() {
+                    for (k, first) in [MX_EQ_GAIN, MX_EQ_FREQ, MX_EQ_WIDTH].into_iter().enumerate() {
+                        set_param_record(data, loc, first + b as u8, band[k]);
+                    }
+                }
+            }
+        }
         let latency = (m.latency_out, m.latency_in);
         let relatency = latency != (old.latency_out, old.latency_in);
         if relatency || (m.enabled, m.polarity, m.swap, m.slots_enabled) != (old.enabled, old.polarity, old.swap, old.slots_enabled) {
@@ -4050,6 +4062,15 @@ fn param_rec(pid: u8, kind: u8, loc: u16, v: i32) -> [u8; MIXER_REC_LEN] {
     r
 }
 
+/// The equaliser record `pid`'s value in `eq`, or `None` when `pid` is not one of the nine (gain 0xD0 + band,
+/// frequency 0xD8 + band, width 0xE0 + band; spec: flp/events/mixer.md).
+fn track_eq_value(eq: &[[i32; 3]; 3], pid: u8) -> Option<i32> {
+    [MX_EQ_GAIN, MX_EQ_FREQ, MX_EQ_WIDTH]
+        .into_iter()
+        .enumerate()
+        .find_map(|(k, first)| (first..first + 3).contains(&pid).then(|| eq[usize::from(pid - first)][k]))
+}
+
 /// One track's parameter records in file order: each slot's LED and mix, the track parameters, the route levels
 /// (spec: flp/events/plugins.md §5, mixer.md "Event 225").
 fn track_records(t: u16, m: Option<&MixerTrack>) -> Vec<u8> {
@@ -4066,7 +4087,7 @@ fn track_records(t: u16, m: Option<&MixerTrack>) -> Vec<u8> {
             MX_VOLUME => m.volume.map_or(v, |x| (x * 16000.0).round() as i32),
             MX_PAN => m.pan.map_or(v, |x| (x * 6400.0).round() as i32),
             MX_STEREO => m.stereo_separation.map_or(v, |x| (x * 64.0).round() as i32),
-            _ => v,
+            _ => track_eq_value(&m.eq, pid).unwrap_or(v),
         };
         out.extend(param_rec(pid, MX_KIND_PARAM, mixer_location(t, 0), v));
     }
@@ -4184,6 +4205,7 @@ fn mixer_is_default(mixer: &[MixerTrack]) -> bool {
             && t.slots.iter().all(Option::is_none)
             && t.slot_on.iter().all(|&on| on)
             && t.slot_mix.iter().all(|&m| m == 1.0)
+            && t.eq == os_model::EQ_DEFAULT
             && !t.polarity
             && !t.swap
             && t.slots_enabled
@@ -5491,6 +5513,49 @@ mod tests {
         edited.mixer[2].slot_mix[9] = 0.75;
         apply(&edited, &mut file).unwrap();
         assert_eq!(load(&file).unwrap().mixer, edited.mixer);
+    }
+
+    /// A track's three-band equaliser is written with the project (spec: flp/events/mixer.md, event 225): a created
+    /// project reads it back, `apply` writes changes into an existing file, and it follows a track moved in the mixer.
+    #[test]
+    fn mixer_track_eq_round_trips_and_follows_a_moved_track() {
+        use os_model::MixerTrack;
+        let mut p = new_project();
+        p.arrangements.push(default_arrangement());
+        p.mixer = (0..18).map(MixerTrack::new).collect();
+        p.mixer[17].routes.clear();
+        p.mixer[2].eq = [[-1200, 6000, 12000], [300, 30000, 18000], [900, 56000, 20000]];
+        p.mixer[0].eq[1] = [250, 35000, 9000];
+        p.mixer[17].eq[2] = [-450, 50000, 12345];
+        let mut file = FlpFile::parse(&create(&p).unwrap().to_bytes().unwrap()).unwrap();
+        let back = load(&file).unwrap();
+        assert_eq!(back.mixer, p.mixer);
+        assert!(unsaved_parts(&p, &file).is_empty());
+
+        // An edit written into the file the model was read from.
+        let mut edited = back.clone();
+        edited.mixer[2].eq[1] = [42, 31000, 16000];
+        apply(&edited, &mut file).unwrap();
+        let file = FlpFile::parse(&file.to_bytes().unwrap()).unwrap();
+        assert_eq!(load(&file).unwrap().mixer, edited.mixer);
+
+        // Moving a track takes its equaliser with it, not the one at its old place.
+        let mut moved = edited;
+        moved.mixer.swap(2, 4);
+        moved.mixer = renumbered(moved.mixer);
+        let mut file = file;
+        apply(&moved, &mut file).unwrap();
+        let back = load(&FlpFile::parse(&file.to_bytes().unwrap()).unwrap()).unwrap();
+        assert_eq!(back.mixer, moved.mixer);
+        assert_eq!(back.mixer[4].eq, [[-1200, 6000, 12000], [42, 31000, 16000], [900, 56000, 20000]]);
+
+        // A project whose file has no mixer cannot hold it: the EQ is reported as unsaved.
+        let mut no_mixer = moved;
+        no_mixer.arrangements.clear();
+        no_mixer.mixer[2].eq[0][0] = -900;
+        let file = create(&no_mixer).unwrap();
+        assert_eq!(unsaved_parts(&no_mixer, &file), vec!["mixer settings"]);
+        assert!(load(&file).unwrap().mixer.is_empty());
     }
 
     /// A track's audio input and output, record source and monitor mode are events 154, 147, 165 and 166 (spec:

@@ -755,8 +755,6 @@ fn renumbered_mixer_tracks_survive() {
                 m.send_levels.sort_by_key(|s| s.0);
             }
         };
-        // Track EQ is not written by `apply` yet: it stays with the file's track positions.
-        let no_eq = |mixer: &[MixerTrack]| mixer.iter().map(|m| MixerTrack { eq: os_model::EQ_DEFAULT, ..m.clone() }).collect::<Vec<_>>();
         let swap = |t: usize| Some(if t == a { b } else if t == b { a } else { t });
 
         // Moved: a and b swap places.
@@ -767,7 +765,7 @@ fn renumbered_mixer_tracks_survive() {
         apply(&moved, &mut file).unwrap_or_else(|e| panic!("{path}: {e}"));
         let file = FlpFile::parse(&file.to_bytes().unwrap()).unwrap();
         let back = load(&file).unwrap();
-        assert_eq!(no_eq(&back.mixer), no_eq(&moved.mixer), "{path}");
+        assert_eq!(back.mixer, moved.mixer, "{path}");
         let (a32, b32) = (a as u32, b as u32);
         assert_eq!(slot_records(&file), expect(&|t| Some(if t == a32 { b32 } else if t == b32 { a32 } else { t })), "{path}: moved");
         // Moved back from the saved file: the original records.
@@ -776,7 +774,7 @@ fn renumbered_mixer_tracks_survive() {
         renumber(&mut back_again.mixer, &swap);
         let mut file2 = file.clone();
         apply(&back_again, &mut file2).unwrap_or_else(|e| panic!("{path}: {e}"));
-        assert_eq!(no_eq(&load(&file2).unwrap().mixer), no_eq(&project.mixer), "{path}");
+        assert_eq!(load(&file2).unwrap().mixer, project.mixer, "{path}");
         assert_eq!(slot_records(&file2), original, "{path}: moved back");
 
         // Deleted: a goes, the later inserts move one down and a default insert comes before the current track.
@@ -791,7 +789,7 @@ fn renumbered_mixer_tracks_survive() {
         let mut file = FlpFile::parse(&bytes).unwrap();
         apply(&fewer, &mut file).unwrap_or_else(|e| panic!("{path}: {e}"));
         let file = FlpFile::parse(&file.to_bytes().unwrap()).unwrap();
-        assert_eq!(no_eq(&load(&file).unwrap().mixer), no_eq(&fewer.mixer), "{path}");
+        assert_eq!(load(&file).unwrap().mixer, fewer.mixer, "{path}");
         let new_of = |t: u32| match t.cmp(&a32) {
             std::cmp::Ordering::Less => Some(t),
             std::cmp::Ordering::Equal => None,
