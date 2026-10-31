@@ -11,7 +11,7 @@
 
 use os_model::target::Target;
 
-use super::param_auto::{self, Dest, ParamEvent};
+use super::param_auto;
 use super::{Engine, Fx, MixTrack};
 use crate::formula::Formula;
 
@@ -28,8 +28,6 @@ pub(super) struct CtlLink {
     target: Target,
     formula: Option<Formula>,
     smooth: Option<Option<[f64; 2]>>,
-    /// The parameter value last handed on (plugin parameters only get a value when it changes).
-    last: Option<i64>,
 }
 
 /// The project's links from controllers in mixer slots to targets the engine plays. A link from elsewhere (a
@@ -53,7 +51,6 @@ pub(super) fn links(project: &os_model::Project) -> Vec<CtlLink> {
                 target,
                 formula,
                 smooth: c.smoothing().then_some(None),
-                last: None,
             })
         })
         .collect()
@@ -98,17 +95,9 @@ impl Engine {
             let Some(v) = read(&self.tracks, link.track, link.slot, link.output) else { continue };
             let n = link.value(f64::from(v));
             if param_auto::is_param(link.target) {
-                // Per-tick plugins take it as a clip's value; the others as an event at the tick's start.
+                // The resolver decides: per-tick plugins get the tick's one value, the others an event at its start.
                 self.params.tick_value(link.target, n);
-                if link.last != Some(n) {
-                    link.last = Some(n);
-                    let (dest, index) = match link.target {
-                        Target::ChannelParam(c, k) => (Dest::Channel(usize::from(c)), k),
-                        Target::SlotParam(t, s, k) => (Dest::Slot(usize::from(t), usize::from(s)), k),
-                        _ => continue,
-                    };
-                    self.params.events.push(ParamEvent { dest, offset: 0, index: u32::from(index), value: n as f64 / 1_073_741_824.0 });
-                }
+                self.params.offer_block(link.target, 0, param_auto::level(n));
             } else {
                 self.auto_value(link.target, n, len);
             }

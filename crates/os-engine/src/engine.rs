@@ -2780,6 +2780,7 @@ impl Engine {
         self.run_automation(len);
         self.run_param_automation(len);
         self.run_controllers(len);
+        self.params.flush_ticks();
         for b in &mut self.bus {
             b.clear();
             b.resize(len * 2, 0.0);

@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Automation clips that move plugin parameters (song mode): each clip's curve is sampled every [`PARAM_STEP`] frames
-//! inside a block and every value that changed becomes a parameter event at its frame offset, for the channel's
-//! instrument or the mixer slot's hosted effect. The plugins smooth their parameters themselves.
+//! Plugin-parameter automation: the one place a value for a parameter is resolved, whatever drives it — an automation
+//! clip, a pattern control point or a controller link. Values are carried as `Round(level * 2^30)` and a target is sent
+//! a value only when that integer changes. A block-rate source becomes an event at its frame offset; per-tick sources
+//! are staged for the tick and flushed as one value per target, after every source has had its say.
 //!
-// spec: plugins/plugin-parameters.md §2 (automation playback), §3 (targets)
+// spec: plugins/plugin-parameters.md §2 (automation playback), §3 (targets), plugins/fruity-abi.md "Parameters"
 
 use os_model::target::Target;
 
@@ -42,8 +43,8 @@ pub(super) struct ParamEvent {
 pub(super) struct ParamAuto {
     /// This block's events, in frame order.
     pub events: Vec<ParamEvent>,
-    /// Last value sent per target (a value is only sent again when it changes).
-    last: Vec<(Target, f64)>,
+    /// Last value sent per target, as `Round(level * 2^30)`, for the block-rate events.
+    block: Vec<(Target, i64)>,
     /// Scratch: targets already handled at the current step.
     done: Vec<Target>,
     /// The playlist has clips on plugin parameters at all.
@@ -52,22 +53,63 @@ pub(super) struct ParamAuto {
     /// clip hands on, at offset 0, when it differs from the last one handed on (spec: plugins/fruity-abi.md
     /// "Parameters", audio/automation.md "When a clip acts").
     pub ticks: Vec<ParamEvent>,
-    /// Last per-tick value handed on per target (`Round(level * 2^30)`).
-    last_tick: Vec<(Target, i64)>,
+    /// This tick's staged values, one per target: the last source to write wins (`flush_ticks`).
+    pending: Vec<(Target, i64)>,
+    /// Last per-tick value sent per target (`Round(level * 2^30)`).
+    tick: Vec<(Target, i64)>,
     /// Pattern control points on plugin parameters due on the tick starting now: target, level 0..1. They act before
     /// the clips of the same tick (spec: audio/automation.md "Pattern control points").
     pub points: Vec<(Target, f64)>,
+}
+
+/// A parameter value's resolution: `Round(level * 2^30)`, what links and per-tick plugins already carry (spec:
+/// plugins/fruity-abi.md "Parameters"). One resolution for every source, so "changed" means one thing.
+pub const LEVELS: f64 = 1_073_741_824.0;
+
+/// `level` (0..1) as the integer every source hands on and compares.
+pub fn quantize(level: f64) -> i64 {
+    (level.clamp(0.0, 1.0) * LEVELS).round() as i64
+}
+
+/// The level `n` stands for.
+pub fn level(n: i64) -> f64 {
+    n as f64 / LEVELS
+}
+
+/// Where a plugin parameter's values go, and its index in the plugin's list.
+fn target_dest(target: Target) -> Option<(Dest, u32)> {
+    match target {
+        Target::ChannelParam(c, k) => Some((Dest::Channel(usize::from(c)), u32::from(k))),
+        Target::SlotParam(t, s, k) => Some((Dest::Slot(usize::from(t), usize::from(s)), u32::from(k))),
+        _ => None,
+    }
+}
+
+/// The one rule every source follows: a target is sent a value when the integer differs from the one last sent.
+fn changed(sent: &mut Vec<(Target, i64)>, target: Target, n: i64) -> bool {
+    match sent.iter_mut().find(|(t, _)| *t == target) {
+        Some((_, last)) if *last == n => false,
+        Some((_, last)) => {
+            *last = n;
+            true
+        }
+        None => {
+            sent.push((target, n));
+            true
+        }
+    }
 }
 
 impl ParamAuto {
     pub fn new(any: bool) -> Self {
         ParamAuto {
             events: Vec::with_capacity(256),
-            last: Vec::with_capacity(16),
+            block: Vec::with_capacity(16),
             done: Vec::with_capacity(16),
             any,
             ticks: Vec::with_capacity(16),
-            last_tick: Vec::with_capacity(16),
+            pending: Vec::with_capacity(16),
+            tick: Vec::with_capacity(16),
             points: Vec::with_capacity(16),
         }
     }
@@ -80,48 +122,60 @@ impl ParamAuto {
 
     /// This tick's points for the plugins that take one value per tick.
     pub fn point_ticks(&mut self) {
+        self.pending.clear();
         for i in 0..self.points.len() {
-            let (target, level) = self.points[i];
-            self.tick_value(target, (level * 1_073_741_824.0).round() as i64);
+            let (target, lvl) = self.points[i];
+            self.offer_tick(target, quantize(lvl));
         }
     }
 
     /// This tick's points for the other plugins, at the tick's first frame; then they are done.
     fn point_events(&mut self) {
-        for (target, level) in std::mem::take(&mut self.points) {
-            let (dest, index) = match target {
-                Target::ChannelParam(c, k) => (Dest::Channel(usize::from(c)), k),
-                Target::SlotParam(t, s, k) => (Dest::Slot(usize::from(t), usize::from(s)), k),
-                _ => continue,
-            };
-            match self.last.iter_mut().find(|(t, _)| *t == target) {
-                Some((_, last)) => *last = level,
-                None => self.last.push((target, level)),
-            }
-            self.events.push(ParamEvent { dest, offset: 0, index: u32::from(index), value: level });
+        for (target, lvl) in std::mem::take(&mut self.points) {
+            self.offer_block(target, 0, lvl);
         }
     }
 
     /// Values are sent again from scratch (after a seek: the plugin gets the value at the new position).
     pub fn forget(&mut self) {
-        self.last.clear();
-        self.last_tick.clear();
+        self.block.clear();
+        self.pending.clear();
+        self.tick.clear();
     }
 
-    /// The value `n` (`Round(level * 2^30)`) an automation clip hands on to plugin parameter `target` for the tick
-    /// starting now, kept for per-tick plugins when it changed.
+    /// A value for a plugin that takes one per tick (a clip, a pattern point or a controller link): staged for this
+    /// tick, the last source to write the target winning (`flush_ticks`).
     pub fn tick_value(&mut self, target: Target, n: i64) {
-        let (dest, index) = match target {
-            Target::ChannelParam(c, k) => (Dest::Channel(usize::from(c)), k),
-            Target::SlotParam(t, s, k) => (Dest::Slot(usize::from(t), usize::from(s)), k),
-            _ => return,
-        };
-        match self.last_tick.iter_mut().find(|(t, _)| *t == target) {
-            Some((_, last)) if *last == n => return,
-            Some((_, last)) => *last = n,
-            None => self.last_tick.push((target, n)),
+        self.offer_tick(target, n);
+    }
+
+    /// Stages a per-tick value for `target`; one value per target per tick.
+    pub fn offer_tick(&mut self, target: Target, n: i64) {
+        match self.pending.iter_mut().find(|(t, _)| *t == target) {
+            Some((_, v)) => *v = n,
+            None => self.pending.push((target, n)),
         }
-        self.ticks.push(ParamEvent { dest, offset: 0, index: u32::from(index), value: n as f64 / 1_073_741_824.0 });
+    }
+
+    /// A value for a plugin that takes them through the block, at `offset` frames: an event, when it changed.
+    pub fn offer_block(&mut self, target: Target, offset: u32, lvl: f64) {
+        let Some((dest, index)) = target_dest(target) else { return };
+        let n = quantize(lvl);
+        if !changed(&mut self.block, target, n) {
+            return;
+        }
+        self.events.push(ParamEvent { dest, offset, index, value: level(n) });
+    }
+
+    /// The tick's staged values as one event per target, for the plugins that take one value per tick.
+    pub fn flush_ticks(&mut self) {
+        for (target, n) in std::mem::take(&mut self.pending) {
+            let Some((dest, index)) = target_dest(target) else { continue };
+            if !changed(&mut self.tick, target, n) {
+                continue;
+            }
+            self.ticks.push(ParamEvent { dest, offset: 0, index, value: level(n) });
+        }
     }
 
     /// Channel `c`'s per-tick values for this tick.
@@ -143,8 +197,8 @@ impl ParamAuto {
             // A busy instance misses these values: they are sent again at the next step.
             let Ok(mut h) = h.try_lock() else {
                 let mine = |tg: &Target| matches!(*tg, Target::SlotParam(a, b, _) if usize::from(a) == t && usize::from(b) == fx.slot);
-                self.last.retain(|(tg, _)| !mine(tg));
-                self.last_tick.retain(|(tg, _)| !mine(tg));
+                self.block.retain(|(tg, _)| !mine(tg));
+                self.tick.retain(|(tg, _)| !mine(tg));
                 continue;
             };
             let list = if h.tick_params_fx() { &self.ticks } else { &self.events };
@@ -166,8 +220,8 @@ impl ParamAuto {
     /// A busy instrument missed channel `c`'s values: send them again at the next step.
     pub fn resend_channel(&mut self, c: usize) {
         let mine = |tg: &Target| matches!(*tg, Target::ChannelParam(ch, _) if usize::from(ch) == c);
-        self.last.retain(|(tg, _)| !mine(tg));
-        self.last_tick.retain(|(tg, _)| !mine(tg));
+        self.block.retain(|(tg, _)| !mine(tg));
+        self.tick.retain(|(tg, _)| !mine(tg));
     }
 }
 
@@ -222,17 +276,7 @@ impl Engine {
                         }
                     };
                     let Some(v) = v else { continue };
-                    match pa.last.iter_mut().find(|(t, _)| *t == target) {
-                        Some((_, last)) if (*last - v).abs() < 1e-7 => continue,
-                        Some((_, last)) => *last = v,
-                        None => pa.last.push((target, v)),
-                    }
-                    let (dest, index) = match target {
-                        Target::ChannelParam(c, k) => (Dest::Channel(usize::from(c)), k),
-                        Target::SlotParam(t, s, k) => (Dest::Slot(usize::from(t), usize::from(s)), k),
-                        _ => continue,
-                    };
-                    pa.events.push(ParamEvent { dest, offset: step as u32, index: u32::from(index), value: v });
+                    pa.offer_block(target, step as u32, v);
                 }
             }
         }
@@ -508,5 +552,39 @@ mod tests {
             assert_eq!(seen.len(), 2, "slot {slot}: {seen:?}");
             assert!(seen.iter().all(|s| (s.2 - 0.25).abs() < 1e-9));
         }
+    }
+
+    /// Whatever drives a plugin parameter — a pattern point, a clip or a controller link — the resolver hands on one
+    /// value per target per tick, the last source winning, and only when the value changed.
+    #[test]
+    fn every_source_resolves_to_one_value_per_tick() {
+        let target = os_model::target::decode(os_model::target::channel_param(0, 7));
+
+        // Per-tick plugins: point, clip and link write the tick's value; the link (last) decides.
+        let mut pa = super::ParamAuto::new(true);
+        pa.point(target, 0.25);
+        pa.point_ticks();
+        pa.tick_value(target, super::quantize(0.5));
+        pa.tick_value(target, super::quantize(0.75));
+        pa.flush_ticks();
+        assert_eq!(pa.ticks.len(), 1, "one value for the target");
+        assert_eq!(pa.ticks[0].value, 0.75);
+        assert_eq!(pa.ticks[0].offset, 0);
+        // The same value again is not sent.
+        pa.tick_value(target, super::quantize(0.75));
+        pa.flush_ticks();
+        assert_eq!(pa.ticks.len(), 1);
+
+        // Block-rate plugins: the sources arrive in order (point, clip, link); an unchanged value is not repeated.
+        let mut pa = super::ParamAuto::new(true);
+        pa.point(target, 0.25);
+        pa.point_events();
+        pa.offer_block(target, 64, 0.5);
+        pa.offer_block(target, 0, 0.75);
+        let values: Vec<f64> = pa.events.iter().map(|e| e.value).collect();
+        assert_eq!(values, vec![0.25, 0.5, 0.75]);
+        assert_eq!(pa.events.last().unwrap().offset, 0, "the link's value comes last");
+        pa.offer_block(target, 0, 0.75);
+        assert_eq!(pa.events.len(), 3, "unchanged values are not sent");
     }
 }
