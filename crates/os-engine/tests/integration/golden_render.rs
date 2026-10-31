@@ -6,8 +6,8 @@
 //! this test. A change that moves a single sample fails it, which is what lets the engine rework (one sampler voice
 //! path, one automation pipeline, edits without a rebuild) be proven bit-identical instead of re-listened by ear.
 //!
-//! The cases use no files: a sampler without a sample plays the built-in tone, and the hosted case plays a sine
-//! instrument of the test's own, so the corpus runs anywhere (no audio device, no writable temporary directory) and is
+//! The cases use no files: a sampler without a sample plays the built-in tone, and the hosted cases play a sine
+//! instrument and a gain effect of the test's own, so the corpus runs anywhere (no audio device, no writable temporary directory) and is
 //! deterministic from run to run. The test renders every case twice and compares the two runs first, so a corpus case
 //! that stops being deterministic fails here rather than in a confusing fingerprint diff.
 //!
@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use os_engine::effects::peak_ctrl;
-use os_engine::{Engine, Instrument, PlayMode, SampleLibrary, SharedInstrument};
+use os_engine::{Engine, HostedEffect, Instrument, PlayMode, SampleLibrary, SharedEffect, SharedInstrument};
 use os_model::{Arrangement, AutoPoint, Automation, Channel, ChannelKind, Clip, ClipSource, ControllerLink, ControlPoint, MixerTrack, Note, Pattern, Project, SlotPlugin};
 
 /// The rate every case renders at.
@@ -46,6 +46,8 @@ struct Case {
     mode: PlayMode,
     ticks: usize,
     instruments: Vec<(usize, SharedInstrument)>,
+    /// Hosted effects, as (mixer track, slot, instance), set before the first tick.
+    effects: Vec<(usize, usize, SharedEffect)>,
     /// The levels to take in with `Engine::apply_levels` after the first `ticks / 2` ticks.
     level_edit: Option<Project>,
 }
@@ -213,10 +215,19 @@ fn hosted_sine() -> (Project, SharedInstrument) {
 }
 
 /// A deterministic generator: a sine per held key, cut at its note off, 0.1 of full scale.
-#[derive(Default)]
 struct Sine {
     /// (key, phase, velocity)
     voices: Vec<(u8, f32, f32)>,
+    /// Parameter 0: a gain on the output, 0..1.
+    level: f32,
+    /// Parameter values still to take, at their frame in the next `process` call.
+    pending: Vec<(u32, f64)>,
+}
+
+impl Default for Sine {
+    fn default() -> Sine {
+        Sine { voices: Vec::new(), level: 1.0, pending: Vec::new() }
+    }
 }
 
 impl Instrument for Sine {
@@ -231,15 +242,26 @@ impl Instrument for Sine {
 
     fn process(&mut self, rate: u32, left: &mut [f32], right: &mut [f32]) {
         let tau = std::f32::consts::TAU;
+        let mut events = std::mem::take(&mut self.pending).into_iter().peekable();
         for i in 0..left.len() {
+            // The values automation handed on before this call, at their own frames (a plugin's own smoothing is the
+            // plugin's; this one steps at once).
+            while let Some(&(at, level)) = events.peek() {
+                if at as usize <= i {
+                    self.level = level as f32;
+                    events.next();
+                } else {
+                    break;
+                }
+            }
             let mut s = 0.0;
             for v in &mut self.voices {
                 let hz = 440.0 * 2f32.powf((f32::from(v.0) - 69.0) / 12.0);
                 s += v.2 * 0.1 * v.1.sin();
                 v.1 = (v.1 + tau * hz / rate as f32) % tau;
             }
-            left[i] = s;
-            right[i] = s;
+            left[i] = s * self.level;
+            right[i] = s * self.level;
         }
     }
 
@@ -249,6 +271,52 @@ impl Instrument for Sine {
 
     fn reset(&mut self) {
         self.voices.clear();
+    }
+
+    fn param(&mut self, offset: u32, index: u32, value: f64) {
+        if index == 0 {
+            self.pending.push((offset, value));
+        }
+    }
+}
+
+/// A slot effect with one parameter: parameter 0 scales the track, so a clip moving it is audible in the render.
+struct Gain {
+    level: f32,
+    pending: Vec<(u32, f64)>,
+}
+
+impl Default for Gain {
+    fn default() -> Gain {
+        Gain { level: 1.0, pending: Vec::new() }
+    }
+}
+
+impl HostedEffect for Gain {
+    fn process_fx(&mut self, _rate: u32, left: &mut [f32], right: &mut [f32]) {
+        let mut events = std::mem::take(&mut self.pending).into_iter().peekable();
+        for i in 0..left.len() {
+            while let Some(&(at, level)) = events.peek() {
+                if at as usize <= i {
+                    self.level = level as f32;
+                    events.next();
+                } else {
+                    break;
+                }
+            }
+            left[i] *= self.level;
+            right[i] *= self.level;
+        }
+    }
+
+    fn param_fx(&mut self, offset: u32, index: u32, value: f64) {
+        if index == 0 {
+            self.pending.push((offset, value));
+        }
+    }
+
+    fn param_range_fx(&self, index: usize) -> Option<(f64, f64)> {
+        (index == 0).then_some((0.0, 1.0))
     }
 }
 
@@ -313,17 +381,62 @@ fn controller_links() -> Project {
     p
 }
 
+/// Song mode with plugin-parameter automation: one clip ramps a hosted instrument's parameter and a slot effect's,
+/// so the path that samples a curve every 64 frames (and the one-tick-ahead rule) is pinned in the render itself.
+fn plugin_automation() -> (Project, SharedInstrument) {
+    let mut automation = channel(1, 0);
+    automation.kind = ChannelKind::Automation;
+    (automation.pan, automation.volume) = (-1.0, 1.0);
+    let mut p = Project {
+        ppq: 96,
+        tempo: Some(130.0),
+        channels: vec![channel(0, 1), automation],
+        mixer: vec![MixerTrack::new(0), MixerTrack::new(1)],
+        patterns: vec![Pattern {
+            number: 1,
+            notes: vec![Note { length: 384, key: 60, velocity: 100, ..Note::step(0, 0) }],
+            ..Pattern::default()
+        }],
+        arrangements: vec![Arrangement {
+            id: os_model::Id::NONE,
+            number: 1,
+            name: None,
+            clips: vec![Clip::new(0, 384, 0, ClipSource::Pattern(1)), Clip::new(0, 384, 1, ClipSource::Channel(1))],
+            tracks: vec![],
+            markers: vec![],
+        }],
+        automations: vec![Automation {
+            channel: 1,
+            targets: vec![os_model::target::channel_param(0, 0), os_model::target::slot_param(1, 0, 0)],
+            points: vec![AutoPoint::new(0.0, 1.0), AutoPoint::new(4.0, 0.2)],
+            header: vec![0; 21],
+            tail: vec![],
+            lfo: Default::default(),
+        }],
+        current_arrangement: Some(1),
+        ..Project::default()
+    };
+    p.channels[0].kind = ChannelKind::Plugin;
+    p.channels[0].plugin = Some("Test Sine".into());
+    p.mixer[1].slots[0] = Some(SlotPlugin { id: os_model::Id::NONE, name: "Test Gain".into(), state: vec![] });
+    p.mixer[1].routes = vec![0];
+    (p, Arc::new(Mutex::new(Sine::default())))
+}
+
 fn cases() -> Vec<Case> {
     let (hooked, sine) = hosted_sine();
     let (base, edited) = level_edit_in_place();
+    let (automated, automated_sine) = plugin_automation();
+    let gain: SharedEffect = Arc::new(Mutex::new(Gain::default()));
     vec![
-        Case { name: "pattern_sampler", project: pattern_sampler(), mode: PlayMode::Pattern(1), ticks: 64, instruments: vec![], level_edit: None },
-        Case { name: "song_clips_and_sends", project: song_clips_and_sends(), mode: PlayMode::Song, ticks: 128, instruments: vec![], level_edit: None },
-        Case { name: "control_points", project: control_points(), mode: PlayMode::Pattern(1), ticks: 72, instruments: vec![], level_edit: None },
-        Case { name: "level_edit_in_place", project: base, mode: PlayMode::Pattern(1), ticks: 64, instruments: vec![], level_edit: Some(edited) },
-        Case { name: "hosted_sine", project: hooked, mode: PlayMode::Pattern(1), ticks: 40, instruments: vec![(0, sine)], level_edit: None },
-        Case { name: "automation_clip", project: automation_clip(), mode: PlayMode::Song, ticks: 160, instruments: vec![], level_edit: None },
-        Case { name: "controller_links", project: controller_links(), mode: PlayMode::Pattern(1), ticks: 48, instruments: vec![], level_edit: None },
+        Case { name: "pattern_sampler", project: pattern_sampler(), mode: PlayMode::Pattern(1), ticks: 64, instruments: vec![], effects: vec![], level_edit: None },
+        Case { name: "song_clips_and_sends", project: song_clips_and_sends(), mode: PlayMode::Song, ticks: 128, instruments: vec![], effects: vec![], level_edit: None },
+        Case { name: "control_points", project: control_points(), mode: PlayMode::Pattern(1), ticks: 72, instruments: vec![], effects: vec![], level_edit: None },
+        Case { name: "level_edit_in_place", project: base, mode: PlayMode::Pattern(1), ticks: 64, instruments: vec![], effects: vec![], level_edit: Some(edited) },
+        Case { name: "hosted_sine", project: hooked, mode: PlayMode::Pattern(1), ticks: 40, instruments: vec![(0, sine)], effects: vec![], level_edit: None },
+        Case { name: "automation_clip", project: automation_clip(), mode: PlayMode::Song, ticks: 160, instruments: vec![], effects: vec![], level_edit: None },
+        Case { name: "controller_links", project: controller_links(), mode: PlayMode::Pattern(1), ticks: 48, instruments: vec![], effects: vec![], level_edit: None },
+        Case { name: "plugin_automation", project: automated, mode: PlayMode::Song, ticks: 128, instruments: vec![(0, automated_sine)], effects: vec![(1, 0, gain)], level_edit: None },
     ]
 }
 
@@ -333,6 +446,9 @@ fn cases() -> Vec<Case> {
 fn render(case: &Case) -> Vec<Line> {
     let mut library = SampleLibrary::new(None);
     let mut engine = Engine::with_instruments(&case.project, &mut library, RATE, case.mode, &case.instruments);
+    for (track, slot, fx) in &case.effects {
+        engine.set_effect(*track, *slot, fx.clone());
+    }
     let half = case.ticks / 2;
     let mut lines = Vec::new();
     let mut tick = 0;
