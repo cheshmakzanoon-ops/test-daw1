@@ -249,9 +249,145 @@ pub fn read_by(len: usize, pos: f64, ratio: f64, quality: Quality, at: impl Fn(u
     (l, r)
 }
 
+/// A voice's read with the engine's kernel: a Blackman window `2 w` frames wide around the position, its sinc widened
+/// by `step` above 1 (spec: audio/export.md §3 "Resampling"). `exact` copies the frame as it is (the caller knows the
+/// step is 1 and the position whole); `w <= 1` reads linearly.
+///
+/// This is not [`read`]: [`read`] is the FL sampler resampler Lemon Sampler's voices use, whose window grows with the
+/// ratio. The engine's sampler channels and audio clips read with this one, so the two agree where both are exact: a
+/// whole frame at a ratio of 1.
+pub fn read_windowed(left: &[f32], right: &[f32], pos: f64, step: f64, w: f64, exact: bool) -> (f32, f32) {
+    let len = left.len().min(right.len());
+    if len == 0 {
+        return (0.0, 0.0);
+    }
+    let pos = pos.max(0.0);
+    let i = (pos as usize).min(len - 1);
+    if exact {
+        return (left[i], right[i]);
+    }
+    if w <= 1.0 {
+        let j = (i + 1).min(len - 1);
+        let x = (pos - i as f64) as f32;
+        return (left[i] + (left[j] - left[i]) * x, right[i] + (right[j] - right[i]) * x);
+    }
+    let scale = step.max(1.0);
+    let i0 = (pos - w).ceil().max(0.0) as usize;
+    let i1 = ((pos + w).floor() as usize).min(len - 1);
+    let (mut l, mut r) = (0.0f64, 0.0f64);
+    for k in i0..=i1 {
+        let t = k as f64 - pos;
+        let weight = sinc(t / scale) / scale * blackman(t, w);
+        l += f64::from(left[k]) * weight;
+        r += f64::from(right[k]) * weight;
+    }
+    (l as f32, r as f32)
+}
+
+/// `sin(pi x) / (pi x)`, 1 at 0.
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        let px = PI * x;
+        px.sin() / px
+    }
+}
+
+/// The Blackman window at `t` for a half-width of `w`: 1 at 0, 0 at `w`.
+fn blackman(t: f64, w: f64) -> f64 {
+    if t.abs() >= w {
+        return 0.0;
+    }
+    let x = PI * t / w;
+    0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's kernel straight from its formula, for the null test below.
+    fn engine_reference(x: &[f32], pos: f64, step: f64, w: f64) -> f32 {
+        let scale = step.max(1.0);
+        let i0 = (pos - w).ceil().max(0.0) as usize;
+        let i1 = ((pos + w).floor() as usize).min(x.len() - 1);
+        let mut sum = 0.0f64;
+        for k in i0..=i1 {
+            let t = k as f64 - pos;
+            let u = t / scale;
+            let s = if u == 0.0 { 1.0 } else { (PI * u).sin() / (PI * u) };
+            let win = if t.abs() >= w {
+                0.0
+            } else {
+                let a = PI * t / w;
+                0.42 + 0.5 * a.cos() + 0.08 * (2.0 * a).cos()
+            };
+            sum += f64::from(x[k]) * s / scale * win;
+        }
+        sum as f32
+    }
+
+    #[test]
+    fn the_engine_kernel_copies_a_whole_frame_at_ratio_one() {
+        let x: Vec<f32> = (0..100).map(|i| i as f32 * 0.01).collect();
+        let y: Vec<f32> = x.iter().rev().copied().collect();
+        assert_eq!(read_windowed(&x, &y, 42.0, 1.0, 13.5, true), (x[42], y[42]));
+        // The last frame is never read past the data.
+        assert_eq!(read_windowed(&x, &y, 99.0, 1.0, 13.5, true), (x[99], y[99]));
+    }
+
+    #[test]
+    fn a_narrow_engine_window_reads_linearly() {
+        let x: Vec<f32> = (0..100).map(|i| (i * 7 % 97) as f32 / 97.0).collect();
+        for &(pos, step) in &[(10.0, 1.0), (10.25, 1.0), (10.5, 0.5), (98.75, 2.0)] {
+            let i = pos as usize;
+            let j = (i + 1).min(x.len() - 1);
+            let a = (pos - i as f64) as f32;
+            let want = x[i] + (x[j] - x[i]) * a;
+            let got = read_windowed(&x, &x, pos, step, 1.0, false).0;
+            assert_eq!(got.to_bits(), want.to_bits(), "{pos} {step}");
+        }
+    }
+
+    #[test]
+    fn the_engine_kernel_follows_its_formula() {
+        let x: Vec<f32> = (0..4096).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        for &(pos, step) in &[(1000.25, 1.0), (1000.25, 1.7), (1234.5, 0.9187), (1500.7, 3.0), (2.5, 1.0)] {
+            for &w in &[13.5, 8.0, 27.0] {
+                let got = read_windowed(&x, &x, pos, step, w, false).0;
+                let want = engine_reference(&x, pos, step, w);
+                assert!((got - want).abs() < 1e-6, "pos {pos} step {step} w {w}: {got} vs {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_engine_window_keeps_a_constant() {
+        let one = vec![0.5f32; 4096];
+        for &(pos, step) in &[(100.25, 0.9187), (2000.5, 1.0), (1500.7, 1.7), (1500.1, 3.0)] {
+            let (l, r) = read_windowed(&one, &one, pos, step, 13.5, false);
+            assert!((l - 0.5).abs() < 2e-3 && l == r, "{pos} {step}: {l}");
+        }
+    }
+
+    // The engine's kernel and Lemon Sampler's agree where both are exact: a whole frame at a ratio of 1.
+    #[test]
+    fn both_kernels_agree_on_a_whole_frame_at_ratio_one() {
+        let left: Vec<f32> = (0..3000).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).collect();
+        let right: Vec<f32> = left.iter().rev().copied().collect();
+        for &pos in &[0.0, 7.0, 1000.0, 2999.0] {
+            for q in [Quality::Table, Quality::Exact] {
+                let sampler = read(&left, &right, pos, 1.0, q);
+                let engine = read_windowed(&left, &right, pos, 1.0, 13.5, true);
+                assert_eq!(
+                    (sampler.0.to_bits(), sampler.1.to_bits()),
+                    (engine.0.to_bits(), engine.1.to_bits()),
+                    "{q:?} at {pos}"
+                );
+            }
+        }
+    }
 
     fn exact(f: f64, ratio: f64) -> Vec<f64> {
         let n = half_width(ratio);

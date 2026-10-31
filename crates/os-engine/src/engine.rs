@@ -3539,8 +3539,8 @@ const SINC_W: f64 = 13.5;
 /// Returns false when the voice has finished.
 ///
 /// The gain ramps from the voice's last gain to the channel's current one over the span (no
-/// change = constant). Rate 1 copies samples exactly. Other rates use a Blackman-windowed sinc with a fixed
-/// 13.5-sample window; above rate 1 the cutoff drops to the output Nyquist (`1/rate`).
+/// change = constant). The frame itself is read by [`os_dsp::resample::read_windowed`], the kernel the engine's
+/// sampler voices and its audio clips share: rate 1 copies samples exactly, other rates use its windowed sinc.
 // spec: audio/sampler-playback.md (resampling)
 /// The place in `ch.keyed` of the copy of its sample stretched for `key`, made when missing (realtime stretch methods
 /// only): the channel's pitch with its fine tune, root and main pitch, and the stretch's own included.
@@ -3585,7 +3585,6 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
     let mut step = base_step;
     // Rate 1 copies samples only while the position is whole (a voice that was pitched keeps its fraction).
     let exact = step == 1.0 && v.pos.fract() == 0.0 && ch.pitch_env.is_none();
-    let mut scale = step.max(1.0);
     let off_s = v.off.map(|o| o as f64 * ch.frame_s);
     let mut pos = v.pos;
     for f in offset..end {
@@ -3611,7 +3610,6 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
         };
         if let Some(p) = &ch.pitch_env {
             step = base_step * 2f64.powf(p.level(t_s, off_s).unwrap_or(0.0) * p.amount / 1200.0);
-            scale = step.max(1.0);
         }
         let fade = match v.release.as_mut() {
             None => 1.0,
@@ -3621,26 +3619,7 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
                 *left as f32 / *len as f32
             }
         };
-        let (l, r) = if exact {
-            let i = pos as usize;
-            (s.left[i], s.right[i])
-        } else if w <= 1.0 {
-            // Linear (an export's 2-point resampling).
-            let i = pos as usize;
-            let (j, x) = ((i + 1).min(n - 1), (pos - i as f64) as f32);
-            (s.left[i] + (s.left[j] - s.left[i]) * x, s.right[i] + (s.right[j] - s.right[i]) * x)
-        } else {
-            let i0 = (pos - w).ceil().max(0.0) as usize;
-            let i1 = ((pos + w).floor() as usize).min(n - 1);
-            let (mut l, mut r) = (0.0f64, 0.0f64);
-            for i in i0..=i1 {
-                let t = i as f64 - pos;
-                let k = sinc(t / scale) / scale * blackman(t, w);
-                l += f64::from(s.left[i]) * k;
-                r += f64::from(s.right[i]) * k;
-            }
-            (l as f32, r as f32)
-        };
+        let (l, r) = os_dsp::resample::read_windowed(&s.left, &s.right, pos, step, w, exact);
         if let Some(r) = glide {
             // The volume parameter glides linearly and the volume law applies to it; the pan glides linearly
             // in the left / right gains (spec: audio/pattern-controls.md).
@@ -3669,23 +3648,6 @@ fn render_voice_into(v: &mut Voice, channels: &[ChannelState], out: &mut [f32], 
     v.gain = (gl, gr);
     v.ramp_left = left;
     pos < n as f64
-}
-
-fn sinc(x: f64) -> f64 {
-    if x == 0.0 {
-        1.0
-    } else {
-        let px = std::f64::consts::PI * x;
-        px.sin() / px
-    }
-}
-
-fn blackman(t: f64, w: f64) -> f64 {
-    if t.abs() >= w {
-        return 0.0;
-    }
-    let x = std::f64::consts::PI * t / w;
-    0.42 + 0.5 * x.cos() + 0.08 * (2.0 * x).cos()
 }
 
 /// One mixer track's own state for its turn in a tick (`mix_track`).
