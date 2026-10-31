@@ -6,5 +6,6 @@
 //! built and linked on its own.
 
 mod fx_null;
+mod golden_render;
 mod live_note_count;
 mod pc_null;
