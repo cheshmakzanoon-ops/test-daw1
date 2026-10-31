@@ -423,6 +423,56 @@ fn plugin_automation() -> (Project, SharedInstrument) {
     (p, Arc::new(Mutex::new(Sine::default())))
 }
 
+/// Song mode with one clip driving every non-plugin target kind: the tempo, a send, two equaliser bands of a track,
+/// its stereo separation, and a channel's pan offset and volume multiplier.
+fn automation_targets() -> Project {
+    let mut automation = channel(1, 0);
+    automation.kind = ChannelKind::Automation;
+    (automation.pan, automation.volume) = (-1.0, 1.0);
+    let mut p = Project {
+        ppq: 96,
+        tempo: Some(130.0),
+        channels: vec![channel(0, 1), automation],
+        mixer: vec![MixerTrack::new(0), MixerTrack::new(1)],
+        patterns: vec![Pattern {
+            number: 1,
+            notes: vec![
+                Note { length: 96, key: 60, velocity: 100, ..Note::step(0, 0) },
+                Note { length: 96, key: 67, velocity: 80, ..Note::step(0, 96) },
+            ],
+            ..Pattern::default()
+        }],
+        arrangements: vec![Arrangement {
+            id: os_model::Id::NONE,
+            number: 1,
+            name: None,
+            clips: vec![Clip::new(0, 384, 0, ClipSource::Pattern(1)), Clip::new(0, 384, 1, ClipSource::Channel(1))],
+            tracks: vec![],
+            markers: vec![],
+        }],
+        automations: vec![Automation {
+            channel: 1,
+            targets: vec![
+                os_model::target::TEMPO,
+                os_model::target::send(1, 0),
+                os_model::target::mixer(1, os_model::target::EQ_GAIN),
+                os_model::target::mixer(1, os_model::target::EQ_FREQ + 1),
+                os_model::target::mixer(1, os_model::target::MIXER_SEPARATION),
+                os_model::target::channel(0, os_model::target::CHANNEL_PAN_OFFSET),
+                os_model::target::channel(0, os_model::target::CHANNEL_VOLUME_MULT),
+            ],
+            points: vec![AutoPoint::new(0.0, 0.22), AutoPoint::new(2.0, 0.32), AutoPoint::new(4.0, 0.24)],
+            header: vec![0; 21],
+            tail: vec![],
+            lfo: Default::default(),
+        }],
+        current_arrangement: Some(1),
+        ..Project::default()
+    };
+    p.mixer[1].routes = vec![0];
+    p
+}
+
 fn cases() -> Vec<Case> {
     let (hooked, sine) = hosted_sine();
     let (base, edited) = level_edit_in_place();
@@ -437,6 +487,7 @@ fn cases() -> Vec<Case> {
         Case { name: "automation_clip", project: automation_clip(), mode: PlayMode::Song, ticks: 160, instruments: vec![], effects: vec![], level_edit: None },
         Case { name: "controller_links", project: controller_links(), mode: PlayMode::Pattern(1), ticks: 48, instruments: vec![], effects: vec![], level_edit: None },
         Case { name: "plugin_automation", project: automated, mode: PlayMode::Song, ticks: 128, instruments: vec![(0, automated_sine)], effects: vec![(1, 0, gain)], level_edit: None },
+        Case { name: "automation_targets", project: automation_targets(), mode: PlayMode::Song, ticks: 128, instruments: vec![], effects: vec![], level_edit: None },
     ]
 }
 
