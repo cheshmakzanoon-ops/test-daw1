@@ -14,6 +14,7 @@
 //       flp/events/mixer.md (routing), audio/pattern-controls.md (repeat, control points),
 //       audio/channel-envelopes.md (volume and pitch envelopes), audio/time-stretch.md
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -311,6 +312,9 @@ struct ChannelState {
     layer: Option<layers::Layer>,
     /// The envelopes, LFOs and filter its hosted instrument gets (one that runs them on its voices).
     voicing: crate::instrument::ChannelVoicing,
+    /// Rust panics its hosted instrument raised while processing, shared with clones of the state: after the first
+    /// the instance is quarantined (not called again) and the channel plays silence.
+    host_panics: Arc<AtomicU32>,
     /// A hosted instrument's channel: the layer whose note it was given last. A hosted instrument hears that layer's
     /// levels on its channel's (a Lemon Studio choice: the host does not reach a plugin's voices one by one, so a
     /// child that also plays notes of its own, or of two layers, hears them all with the levels of the last one).
@@ -795,6 +799,9 @@ struct FxSlot {
     /// Switched on during the song: the effect is emptied before it runs again.
     fresh: bool,
     fx: Fx,
+    /// Rust panics the hosted effect raised while processing: after the first the slot is quarantined and passes the
+    /// sound through.
+    host_panics: AtomicU32,
     /// The delay the effect last reported (read after it processes), and the pad its dry part waits in for it (spec:
     /// audio/delay-compensation.md "A slot's dry part").
     delay: u32,
@@ -824,6 +831,7 @@ impl FxSlot {
             dry: Glide::new(os_dsp::mixer::dry_level(mix)),
             fresh: false,
             fx,
+            host_panics: AtomicU32::new(0),
             delay,
             dry_pad: pdc::Pad::default(),
             key: None,
@@ -1328,6 +1336,7 @@ impl Engine {
                     init_adjust: adjust,
                     layer: (ch.kind == ChannelKind::Layer).then(|| layers::Layer::of(ch)),
                     voicing: crate::instrument::ChannelVoicing::of(ch, ppq),
+                    host_panics: Arc::new(AtomicU32::new(0)),
                     via: None,
                 };
                 state.retune(knob);
@@ -1731,6 +1740,8 @@ impl Engine {
                 param_points(&mut self.controls, mine, |k| h.param_range(k));
             }
             ch.instrument = Slot(Some(inst));
+            // A new instance starts unquarantined: restarting a plugin is the user's recovery from a panic.
+            ch.host_panics.store(0, Ordering::Relaxed);
             // Its delay is read after it processes; the pads are worked out again then.
             self.pdc.due = true;
             // A new instance owes nothing its predecessor missed.
@@ -3495,6 +3506,15 @@ impl Engine {
         }
         self.finished()
     }
+
+    /// Hosted plugins whose processing panicked: each instance is quarantined after its first panic (its channel
+    /// plays silence, its effect slot passes the sound through) and counted here. Panics are caught at the call site; a
+    /// raw fault in a plugin's own native code (a segmentation fault) cannot be caught in-process and still aborts.
+    pub fn host_panics(&self) -> u32 {
+        let instruments = self.channels.iter().map(|c| c.host_panics.load(Ordering::Relaxed));
+        let effects = self.tracks.iter().flat_map(|t| &t.effects).map(|s| s.host_panics.load(Ordering::Relaxed));
+        instruments.chain(effects).sum()
+    }
 }
 
 /// Notes still held on instruments end when the engine goes away (stop, or a new song).
@@ -3855,6 +3875,13 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
     let ch = &cx.channels[c];
     (out.ran, out.active) = (false, false);
     out.buf.clear();
+    // An instrument that panicked once is quarantined: it is not called again and the channel plays silence.
+    if ch.host_panics.load(Ordering::Relaxed) > 0 {
+        out.ran = true;
+        out.delay = 0;
+        out.buf.resize(n * 2, 0.0);
+        return;
+    }
     let Some(inst) = ch.instrument.0.as_ref() else { return };
     let Some(mut inst) = lock_busy(inst, until, cx.wait, cx.export) else {
         *owed += n;
@@ -3954,8 +3981,25 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
         }
     }
     let (l, r) = (&mut sc.l[..n], &mut sc.r[..n]);
-    inst.process(cx.rate, l, r);
-    out.delay = inst.reported_delay();
+    // A panic in the plugin's own processing is caught here, at the host call site: the instance is quarantined (see
+    // the check above), the channel plays silence, and the render goes on. `active` and the delay are read inside the
+    // guard so a later call cannot panic the tick.
+    let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        inst.process(cx.rate, l, r);
+        (inst.reported_delay(), inst.active())
+    }));
+    let (delay, active) = match processed {
+        Ok(v) => v,
+        Err(_) => {
+            ch.host_panics.fetch_add(1, Ordering::Relaxed);
+            l.fill(0.0);
+            r.fill(0.0);
+            out.delay = 0;
+            out.buf.resize(n * 2, 0.0);
+            return;
+        }
+    };
+    out.delay = delay;
     // An instrument without voice gains: the clips' shapes on its whole output. A clip that has ended keeps the channel
     // silent through its choke's tail only while no other clip of the channel plays; then the playing clips' gains
     // alone count. Clips that overlap still share one gain, so a crossfade between them dips.
@@ -3968,7 +4012,7 @@ fn instrument_job(cx: &InstCx, lane: InstLane, sc: &mut multicore::MixScratch) {
             r[f] *= g;
         }
     }
-    out.active = inst.active();
+    out.active = active;
     // An audio clip channel's voices are its playlist clips: their own level is on the channel's output, since a
     // hosted sampler takes velocities only up to 128 (spec: audio/audio-clips.md "Level").
     let cl = ch.clip_level;
@@ -4025,6 +4069,10 @@ fn run_slot(
     if !fx.on {
         return;
     }
+    // An effect that panicked once is quarantined: its slot passes the sound through, no further calls.
+    if fx.host_panics.load(Ordering::Relaxed) > 0 {
+        return;
+    }
     let blend = !(ramp.is_flat() && ramp.first() == 0.0);
     let fresh = std::mem::take(&mut fx.fresh);
     // The dry part waits for the effect's delay (spec: audio/delay-compensation.md "A slot's dry part"): every tick,
@@ -4072,35 +4120,47 @@ fn run_slot(
                 fx.fresh |= fresh;
                 return;
             };
-            if fresh {
-                h.reset_fx();
-            }
-            // A main port takes another input instead of the track's own audio; an auxiliary port without an input hears
-            // the track's own audio too (spec: audio/sidechain.md "Hosted plugins' input buses").
-            let src: &[f32] = main.unwrap_or(buf);
-            l.clear();
-            r.clear();
-            l.extend(src.chunks_exact(2).map(|f| f[0]));
-            r.extend(src.chunks_exact(2).map(|f| f[1]));
-            h.transport_fx(song);
-            // The key's two sides go behind the input's in `l` and `r`.
-            match key {
-                Some(k) => {
-                    l.extend(k.chunks_exact(2).map(|f| f[0]));
-                    r.extend(k.chunks_exact(2).map(|f| f[1]));
+            // A panic in the plugin's own processing is caught here, at the host call site: the slot is quarantined
+            // (see above) and passes the sound through; `buf` is only written after the plugin returns, so the block it
+            // panicked in is left as it came in.
+            let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if fresh {
+                    h.reset_fx();
                 }
-                None => {
-                    l.extend_from_within(..n);
-                    r.extend_from_within(..n);
+                // A main port takes another input instead of the track's own audio; an auxiliary port without an input
+                // hears the track's own audio too (spec: audio/sidechain.md "Hosted plugins' input buses").
+                let src: &[f32] = main.unwrap_or(buf);
+                l.clear();
+                r.clear();
+                l.extend(src.chunks_exact(2).map(|f| f[0]));
+                r.extend(src.chunks_exact(2).map(|f| f[1]));
+                h.transport_fx(song);
+                // The key's two sides go behind the input's in `l` and `r`.
+                match key {
+                    Some(k) => {
+                        l.extend(k.chunks_exact(2).map(|f| f[0]));
+                        r.extend(k.chunks_exact(2).map(|f| f[1]));
+                    }
+                    None => {
+                        l.extend_from_within(..n);
+                        r.extend_from_within(..n);
+                    }
+                }
+                let ((il, kl), (ir, kr)) = (l.split_at_mut(n), r.split_at_mut(n));
+                h.process_fx_keyed(rate, il, ir, (kl, kr));
+                for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+                    f[0] = l[i];
+                    f[1] = r[i];
+                }
+                h.reported_delay_fx()
+            }));
+            match processed {
+                Ok(d) => d,
+                Err(_) => {
+                    fx.host_panics.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
             }
-            let ((il, kl), (ir, kr)) = (l.split_at_mut(n), r.split_at_mut(n));
-            h.process_fx_keyed(rate, il, ir, (kl, kr));
-            for (i, f) in buf.chunks_exact_mut(2).enumerate() {
-                f[0] = l[i];
-                f[1] = r[i];
-            }
-            h.reported_delay_fx()
         }
     };
     if delay != fx.delay {
