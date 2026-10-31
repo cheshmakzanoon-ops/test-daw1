@@ -1380,7 +1380,13 @@ fn audio_thread(rx: Receiver<Cmd>, shared: Arc<Shared>, latest: Arc<Mutex<Option
             Ok(Cmd::Update) => {
                 if let Some(project) = latest.lock().ok().and_then(|mut l| l.take()) {
                     for s in [session.as_mut(), live.as_mut()].into_iter().flatten() {
+                        // A level edit (a fader, a knob, a mute switch, a send, a slot) is taken where the engine
+                        // stands: the graph is rebuilt only when the schedule or the layout changed.
+                        let levels = os_engine::levels_only(&s.project, &project);
                         s.project = project.clone();
+                        if levels && s.engine.lock().is_ok_and(|mut e| e.apply_levels(&project)) {
+                            continue;
+                        }
                         swap(s, &mut library);
                     }
                     if let Some(h) = held.as_mut() {

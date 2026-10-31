@@ -30,12 +30,14 @@ use crate::sample::{Sample, SampleLibrary};
 
 mod controllers;
 mod layers;
+mod levels;
 mod marks;
 mod notes;
 mod param_auto;
 mod multicore;
 mod pdc;
 mod rec;
+pub use levels::levels_only;
 pub use param_auto::PARAM_STEP;
 pub use rec::{Point as RecordPoint, RecordTap};
 
