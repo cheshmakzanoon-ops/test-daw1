@@ -3,8 +3,8 @@
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
 //! Golden renders: a corpus of projects the engine plays whole, with a fingerprint of every 8 ticks committed beside
-//! this test. A change that moves a single sample fails it, which is what lets the engine rework (one sampler voice
-//! path, one automation pipeline, edits without a rebuild) be proven bit-identical instead of re-listened by ear.
+//! this test. A change that moves a single sample fails it, which is what let the engine rework be proven
+//! bit-identical instead of re-listened by ear; `docs/engine-rework.md` records what stayed as it shipped.
 //!
 //! The cases use no files: a sampler without a sample plays the built-in tone, and the hosted cases play a sine
 //! instrument and a gain effect of the test's own, so the corpus runs anywhere (no audio device, no writable temporary directory) and is

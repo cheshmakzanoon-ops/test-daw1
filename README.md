@@ -406,9 +406,8 @@ Lemon Studio is a Cargo workspace of focused crates:
 ## Roadmap
 
 The roadmap is kept on the [Lemon Studio Discord server](https://discord.gg/yC2uCuGs3M), where every item is
-marked as complete, in progress or not started. The broad next steps are the engine rework (sampler voice,
-automation), opening projects from older FL Studio versions, more built-in instruments and effects, and the rest of
-the plugin window features on Linux.
+marked as complete, in progress or not started. The broad next steps are opening projects from older FL Studio
+versions, more built-in instruments and effects, and the rest of the plugin window features on Linux.
 
 ## Development approach
 

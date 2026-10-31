@@ -30,8 +30,10 @@ Systems a fully functional DAW can't ship without.
   Fruity effects stay wrapped instead of becoming the native plugins, and a 3x Osc saved before FL Studio 21 has
   its envelope and filter settings at their defaults
 - [x] **Multi-core mixing.** The engine renders on one audio thread, which limits dense projects
-- [ ] **Engine rework (sampler voice, automation).** The README's roadmap names it as the next big step; land it
-  before the alpha rather than after
+- [x] **Engine rework (sampler voice, automation).** Closed under behaviour preservation (2026-10-31): the shipped
+  sampler kernels and the sub-tick parameter sampling stay as they are, the engine kernel now lives beside the hosted
+  one in `os-dsp`, level edits apply in place, and the golden renders guard every change. The decisions and what would
+  reopen them are in [engine-rework.md](engine-rework.md)
 
 ## Built-in instruments and effects
 
